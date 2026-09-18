@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "migration": "24af5462-c585-4275-a17d-e1d1edfdeb55",
+  "plan": "96e5f757-cece-4ffd-a3e9-72e5d9a425d0",
+  "planHash": "2448a9b15350f2f8b11eb27adc10b791481a5d1198b383c66ee8ef3c17b30173",
+  "scope": {},
+  "status": "incomplete",
+  "counts": {
+    "ambiguous": 1
+  },
+  "occurrences": 1,
+  "verifiedBytes": 0,
+  "unresolved": 1,
+  "lastPass": {
+    "errors": [
+      "test:network"
+    ],
+    "interrupted": false,
+    "skipped": 0,
+    "newArrivals": []
+  },
+  "scopeLimitations": [
+    "Folder scans are not an atomic account snapshot.",
+    "Quotas and APPENDLIMIT may be unknown; preflight does not prove write access.",
+    "Different hostnames may alias one server; operator must confirm independent accounts.",
+    "Pilot scope is not full mailbox coverage.",
+    "Flags are checked at transfer and verification; unsupported metadata is reported."
+  ],
+  "exclusions": [],
+  "items": [
+    {
+      "id": "6f046b1327f8a0154dcb10e7ad9270454c514bd7da50c5a6dfc21a378ac72dca",
+      "mailbox": "test",
+      "folder": "INBOX",
+      "target": "INBOX",
+      "validity": "9007199254740993",
+      "meta": {
+        "uid": "1",
+        "size": 95,
+        "date": "2020-01-02T03:04:05.000Z",
+        "flags": []
+      },
+      "state": "ambiguous",
+      "deviations": [],
+      "hash": "7859e7ca9672f6feab8713b1dcdf0c69d774cd7bcdd3b430a8ea9e15280f9a94",
+      "baseline": {
+        "validity": "9007199254740993",
+        "next": "1",
+        "flags": [
+          "\\Seen",
+          "\\Answered",
+          "\\Flagged",
+          "\\Draft",
+          "\\*"
+        ],
+        "count": 0
+      },
+      "category": "network"
+    }
+  ],
+  "events": [
+    {
+      "at": "2026-09-18T17:43:55.145Z",
+      "category": "network",
+      "data": "{\"mailbox\":\"test\"}"
+    }
+  ],
+  "verification": "raw-sha256; evidence is an observation, not a guarantee of continued destination retention",
+  "synthetic": true
+}

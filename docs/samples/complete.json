@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "migration": "80786fa2-da43-4cd1-9e19-4772c28842d9",
+  "plan": "ee473dea-a098-4b59-b35e-182a0bd17637",
+  "planHash": "f03e64b0170ac61085380da322b34533978ee446cad12bcc2c4d6dfd1c6f75d3",
+  "scope": {},
+  "status": "content_complete_for_recorded_scope",
+  "counts": {
+    "verified": 1
+  },
+  "occurrences": 1,
+  "verifiedBytes": 95,
+  "unresolved": 0,
+  "lastPass": {
+    "errors": [],
+    "interrupted": false,
+    "skipped": 0,
+    "newArrivals": [
+      {
+        "mailbox": "test",
+        "folder": "INBOX",
+        "boundary": "1",
+        "observedNext": "2",
+        "possibleNewArrivals": false
+      }
+    ]
+  },
+  "scopeLimitations": [
+    "Folder scans are not an atomic account snapshot.",
+    "Quotas and APPENDLIMIT may be unknown; preflight does not prove write access.",
+    "Different hostnames may alias one server; operator must confirm independent accounts.",
+    "Pilot scope is not full mailbox coverage.",
+    "Flags are checked at transfer and verification; unsupported metadata is reported."
+  ],
+  "exclusions": [],
+  "items": [
+    {
+      "id": "c77217ccc3069c5d758af49dbf3e1811c2cf80e8519c3bd3f4655160254fcf00",
+      "mailbox": "test",
+      "folder": "INBOX",
+      "target": "INBOX",
+      "validity": "9007199254740993",
+      "meta": {
+        "uid": "1",
+        "size": 95,
+        "date": "2020-01-02T03:04:05.000Z",
+        "flags": []
+      },
+      "state": "verified",
+      "deviations": [],
+      "hash": "7859e7ca9672f6feab8713b1dcdf0c69d774cd7bcdd3b430a8ea9e15280f9a94",
+      "baseline": {
+        "validity": "9007199254740993",
+        "next": "1",
+        "flags": [
+          "\\Seen",
+          "\\Answered",
+          "\\Flagged",
+          "\\Draft",
+          "\\*"
+        ],
+        "count": 0
+      },
+      "destination": {
+        "validity": "9007199254740993",
+        "uid": "1"
+      },
+      "evidence": {
+        "folder": "INBOX",
+        "validity": "9007199254740993",
+        "uid": "1",
+        "hash": "7859e7ca9672f6feab8713b1dcdf0c69d774cd7bcdd3b430a8ea9e15280f9a94",
+        "size": 95,
+        "at": "2026-09-18T17:43:55.121Z",
+        "method": "raw-sha256"
+      }
+    }
+  ],
+  "events": [],
+  "verification": "raw-sha256; evidence is an observation, not a guarantee of continued destination retention",
+  "synthetic": true
+}

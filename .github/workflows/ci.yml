@@ -1,0 +1,41 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  unit-and-ui:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:ui
+  imap-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Start disposable TLS servers
+        run: |
+          docker compose -f test/integration/compose.yaml up --build -d
+          mkdir -p test/integration/private-certs
+          docker compose -f test/integration/compose.yaml cp source:/etc/dovecot/test.pem test/integration/private-certs/source.pem
+          docker compose -f test/integration/compose.yaml cp destination:/etc/dovecot/test.pem test/integration/private-certs/destination.pem
+      - run: npm run integration
+        env:
+          IMAP_INTEGRATION: '1'
+      - if: always()
+        run: docker compose -f test/integration/compose.yaml down --volumes

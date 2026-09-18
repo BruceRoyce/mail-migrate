@@ -1,0 +1,11 @@
+node_modules
+.npm-cache
+dist
+web-dist
+package-lock.json
+test-results
+playwright-report
+test/ui-session.json
+private-*
+test/integration/private-*
+docs/samples

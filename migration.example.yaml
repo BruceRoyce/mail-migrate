@@ -1,0 +1,40 @@
+# Copy to migration.yaml. Explicit hosts must remain usable after MX changes.
+version: 1
+stateDirectory: ./private-migration-state
+reportDirectory: ./private-migration-reports
+defaults:
+  mailboxConcurrency: 1 # Only 1 is supported.
+  messageConcurrency: 1 # APPEND buffers one complete message.
+  verification: full
+  sourceWrites: false
+  existingDestinationPolicy: preserve
+  includeSpamAndTrash: true
+  maxMessageBytes: 26214400 # 25 MiB; oversized messages remain unresolved.
+  memoryBudgetMiB: 512
+  maxOccurrences: 5000 # Raise together with memoryBudgetMiB for larger plans.
+  timeoutSeconds: 60
+  candidateLimit: 100
+mailboxes:
+  - id: support
+    source:
+      host: imap.old-provider.example
+      port: 993
+      tlsMode: implicit # Or starttls; encryption is mandatory.
+      username: support@business.example
+      # caFile: ./trusted-private-ca.pem
+      auth:
+        type: password # Password / app password; OAuth is not implemented.
+        secretRef: env:OLD_SUPPORT_PASSWORD
+        # Alternatively: file:./old-support.secret (UTF-8; final newline removed)
+    destination:
+      host: imap.new-provider.example
+      port: 993
+      tlsMode: implicit
+      username: support@business.example
+      auth:
+        type: password
+        secretRef: env:NEW_SUPPORT_PASSWORD
+    folders:
+      exclude: [] # Exact names, not glob patterns.
+      overrides: {} # Example: {"Sent Items": "Sent"}
+      labelStrategy: unresolved # Choose explicit-folders after reviewing label views.

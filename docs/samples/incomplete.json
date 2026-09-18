@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "migration": "479eb121-da94-4c2b-bbe2-ec61da8d9827",
+  "plan": "55e23155-39f5-433b-bc88-b4684cc2bbf8",
+  "planHash": "e740dce04fa21f4f175be44df7ced7ae3606e3e2dfd5d4c02be04dc654660a64",
+  "scope": {},
+  "status": "incomplete",
+  "counts": {
+    "source_missing": 1
+  },
+  "occurrences": 1,
+  "verifiedBytes": 0,
+  "unresolved": 1,
+  "lastPass": {
+    "errors": [],
+    "interrupted": false,
+    "skipped": 0,
+    "newArrivals": [
+      {
+        "mailbox": "test",
+        "folder": "INBOX",
+        "boundary": "1",
+        "observedNext": "2",
+        "possibleNewArrivals": false
+      }
+    ]
+  },
+  "scopeLimitations": [
+    "Folder scans are not an atomic account snapshot.",
+    "Quotas and APPENDLIMIT may be unknown; preflight does not prove write access.",
+    "Different hostnames may alias one server; operator must confirm independent accounts.",
+    "Pilot scope is not full mailbox coverage.",
+    "Flags are checked at transfer and verification; unsupported metadata is reported."
+  ],
+  "exclusions": [],
+  "items": [
+    {
+      "id": "c7bf7c5696bb15c58c8b5f025a2eccf6940121a2092591d928557d958e03d571",
+      "mailbox": "test",
+      "folder": "INBOX",
+      "target": "INBOX",
+      "validity": "9007199254740993",
+      "meta": {
+        "uid": "1",
+        "size": 95,
+        "date": "2020-01-02T03:04:05.000Z",
+        "flags": []
+      },
+      "state": "source_missing",
+      "deviations": [],
+      "category": "source_missing"
+    }
+  ],
+  "events": [],
+  "verification": "raw-sha256; evidence is an observation, not a guarantee of continued destination retention",
+  "synthetic": true
+}

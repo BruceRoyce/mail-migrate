@@ -1,0 +1,7 @@
+services:
+  source:
+    build: .
+    ports: ['127.0.0.1:1993:993']
+  destination:
+    build: .
+    ports: ['127.0.0.1:2993:993']

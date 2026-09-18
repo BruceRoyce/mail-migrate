@@ -1,0 +1,11 @@
+import { writeFileSync } from 'node:fs';
+import { createWeb } from '../src/server.js';
+import { fixture, Mailbox } from './fake.js';
+const f = fixture();
+f.source.folders.get('INBOX')!.add();
+const folder = new Mailbox();
+folder.add();
+f.source.folders.set('Clients/日本語', folder);
+const w = await createWeb(8788, f.c.stateDirectory, f.c.reportDirectory, f.factory);
+writeFileSync('test/ui-session.json', JSON.stringify({ token: w.token }));
+await w.app.listen({ port: 8788, host: '127.0.0.1' });

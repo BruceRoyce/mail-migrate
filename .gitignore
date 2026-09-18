@@ -1,0 +1,15 @@
+node_modules/
+dist/
+web-dist/
+test-results/
+playwright-report/
+.npm-cache/
+private-*/
+*.sqlite*
+*.secret
+.env*
+migration.yaml
+migration-plan*.json
+test/integration/private-*/
+test/ui-session.json
+test/integration/private-*.json

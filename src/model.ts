@@ -1,0 +1,102 @@
+export type Meta = { uid: string; size: number; date: string | null; flags: string[] };
+export type Folder = {
+  path: string;
+  delimiter: string;
+  special?: string;
+  selectable: boolean;
+  validity?: string;
+  next?: string;
+  count?: number;
+};
+export type View = { validity: string; next: string; flags: string[]; count: number };
+export type Evidence = {
+  folder: string;
+  validity: string;
+  uid: string;
+  hash: string;
+  size: number;
+  at: string;
+  method: 'raw-sha256';
+};
+export type State =
+  | 'discovered'
+  | 'prepared'
+  | 'append_pending'
+  | 'appended_unverified'
+  | 'verified'
+  | 'retryable_failure'
+  | 'permanent_failure'
+  | 'ambiguous'
+  | 'source_missing'
+  | 'content_mismatch'
+  | 'destination_missing'
+  | 'identity_changed';
+export type Item = {
+  id: string;
+  mailbox: string;
+  folder: string;
+  target: string;
+  validity: string;
+  meta: Meta;
+  state: State;
+  hash?: string;
+  evidence?: Evidence;
+  destination?: { validity: string; uid: string };
+  baseline?: View;
+  deviations: string[];
+  category?: string;
+  candidates?: Evidence[];
+};
+export type Mapping = {
+  source: Folder;
+  target: string;
+  existing?: Folder;
+  excluded?: string;
+  messages: Meta[];
+  boundary?: string;
+  bytes: number;
+  oversized: number;
+};
+export type PairPlan = {
+  id: string;
+  source: object;
+  destination: object;
+  mappings: Mapping[];
+  capabilities: { source: string[]; destination: string[] };
+  quota: unknown;
+  appendLimit: number | null;
+  warnings: string[];
+};
+export type Plan = {
+  version: 1;
+  id: string;
+  migration: string;
+  created: string;
+  fingerprint: string;
+  hash: string;
+  scope: { mailbox?: string; pilot?: number };
+  pairs: PairPlan[];
+  blockers: string[];
+  limitations: string[];
+};
+export interface Reader {
+  connect(): Promise<void>;
+  close(): Promise<void>;
+  list(): Promise<Folder[]>;
+  open(folder: string): Promise<View>;
+  scan(boundary: string, ceiling: number, from?: string): Promise<Meta[]>;
+  meta(uid: string): Promise<Meta | null>;
+  raw(uid: string, ceiling: number): Promise<Buffer>;
+  capabilities(): string[];
+  quota(): Promise<unknown>;
+  appendLimit(): number | null;
+}
+export interface Writer extends Reader {
+  create(folder: string): Promise<void>;
+  append(
+    folder: string,
+    bytes: Buffer,
+    flags: string[],
+    date: string,
+  ): Promise<{ validity: string; uid: string } | null>;
+}

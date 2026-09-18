@@ -1,0 +1,55 @@
+# Architecture and safety policy
+
+This is a single-process TypeScript application. React is a local operator interface; Fastify exposes a loopback-only session API. The CLI and UI invoke the same planner, SQLite ledger, transport adapter and migration engine. There are no SMTP operations, background telemetry, external error uploads or content analysis services.
+
+## Dependencies and engine decision
+
+The installed ImapFlow **2.0.5** package is MIT-licensed and declares Node >=20. The application targets Node **24 LTS**, tested locally with 24.11.0. SQLite comes from `node:sqlite` (experimental in that runtime); the lockfile fixes all npm dependencies. Production deployment should keep to the tested major and rerun tests after upgrades.
+
+Checked sources: [ImapFlow API](https://imapflow.com/docs/api/imapflow-client/), [official repository](https://github.com/postalsys/imapflow), installed `dist/esm/imap-flow.d.ts`, `commands/append.js`, `commands/fetch.js` and the download implementation. `append` accepts a complete string or Buffer, not an upload stream. `download` supports bounded chunks and `maxBytes`; full-message downloads use non-marking BODY.PEEK. We disable BINARY decoding and compression to preserve raw MIME representation and avoid decompression buffers. Source selection always uses EXAMINE. Connection cleanup uses immediate socket close, never CLOSE/EXPUNGE.
+
+[Imapsync](https://github.com/imapsync/imapsync) was assessed as an established alternative. Its NLPL licence permits embedding, but deploying its Perl dependencies plus a separate occurrence ledger and byte-level evidence layer would still require application-owned recovery. Its documented header-based duplicate options do not establish the required one-to-one raw-content evidence contract. This first implementation therefore uses ImapFlow as transport and owns the conservative migration policy. This is not a claim that a custom loop is generally safer than imapsync.
+
+## Identity, plans and occurrence accounting
+
+A migration is anchored to explicit endpoint identities (hostname, port, TLS mode, username). Each occurrence is keyed by migration ID, pseudonymous mailbox ID, exact source folder name, decimal UIDVALIDITY and decimal UID. All durable identity numbers are strings; no BigInt is converted to a JavaScript number. Wire UIDs are 32-bit values, within exact numeric range. Message-ID is never consulted.
+
+Plans contain a version, run/migration UUID, plan UUID, configuration fingerprint and SHA-256 over deterministic JSON. Secret references and credentials are excluded from the fingerprint; rotation does not change identity. The approval hash binds confirmation to the plan, but is not a digital signature: someone who controls local files already controls this application. Protect plans and state.
+
+Each plan captures UIDNEXT minus one for every selected source folder, enumerates actual UIDs below it, and stores metadata. Disappearing selected messages become gaps. Later arrivals and new folders need a new catch-up plan. Per-folder scans are not an atomic account-wide snapshot. A pilot persists only its selected occurrences and its explicit limit; observed source counts and bytes cover the larger scanned scope.
+
+Case-folding, NFC-equivalent names, delimiter conversion and many-to-one collisions block planning. Special-use attributes select existing matching folders; ambiguity needs an explicit override. Nonselectable containers are reported; their selectable descendants are independently mapped. Folder names never become local filenames. Gmail capability / aggregate special folders require an explicit physical-folder strategy. Other virtual views may not be detectable: operator review remains required.
+
+## State and recovery
+
+`Store` creates schema version 1, rejects unknown versions and runs SQLite quick_check. Schema DDL is in `src/store.ts`. There is no automatic schema upgrade or reset. Future upgrades must be explicit, backed up and transactional. Tables record migrations, pass plans/boundaries/results, folder identity/checkpoints, occurrences, append attempts, destination evidence and operator events. WAL and synchronous FULL are enabled. Transactional state transitions are explicitly allow-listed.
+
+Normal path: discovered → prepared → append_pending → appended_unverified → verified. Content mismatch, source/destination missing, permanent/retryable failure, identity_changed and ambiguous are unresolved states. `verified` is only assigned after raw SHA-256 comparison and a unique destination occurrence claim. Metadata fidelity is assessed separately. A database uniqueness constraint prevents two source occurrences from claiming the same destination UID in a folder/validity generation.
+
+APPEND intent commits before network I/O. A successful response commits before progress is reported. UIDPLUS response identity is verified by fetching the destination. If no APPENDUID is returned, the occurrence remains unverified/ambiguous. APPEND errors, including quota failures, are conservatively uncertain: no automatic append retry. A later pass examines bounded candidate UIDs at or above the pre-attempt UIDNEXT and compares full content. Candidates are evidence, not proof of which actor created them; even a unique match requires operator linking. If the candidate ceiling is reached, automatic searching stops and the report says so.
+
+An operator may link a specific UID only after exact content comparison and an unclaimed-evidence check, or accept duplicate risk and allow a subsequent approved run to append again. No resolution deletes a suspected duplicate. A crash after remote success but before SQLite commit recovers from append_pending into ambiguous.
+
+Source UIDVALIDITY changes invalidate prior occurrence statuses and block copying that folder. **Automatic source-generation reconciliation is not implemented**; retain the old ledger and reconcile the changed source inventory outside ordinary resume before authorising a distinct migration. Never reset the ledger to make the warning disappear. Destination resets block new copying; explicitly link surviving exact occurrences in the new generation. The folder generation is accepted only after every ledger occurrence in that folder is resolved and verified.
+
+Endpoint changes for an existing mailbox ID and remapping a folder with existing ledger identity require separate reconciliation. Reviewed new plans can change selection/default limits and add folders; those changes do not erase prior unresolved occurrences. A new state directory is not safe resume and may duplicate earlier copies.
+
+## Resource and retry limits
+
+One mailbox pair and one message operate at a time: at most two IMAP connections, including when both accounts share a host. Default message ceiling is 25 MiB; hard configured ceiling is 100 MiB. APPENDLIMIT is honoured when advertised. Unknown means unknown. Oversized messages are unresolved, never truncated. The download cap is ceiling + 1 so an over-limit body is detected, and actual length must match RFC822.SIZE.
+
+APPEND holds a whole Buffer. Downloads use 64 KiB chunks but accumulate a complete message before APPEND; calling this end-to-end streaming would be incorrect. No raw-message spool files exist. The planning allowance is **192 MiB + 6 × message ceiling + 16 KiB × maxOccurrences**. Configured memoryBudgetMiB must cover it. Default 5,000 occurrences and 25 MiB fit a 512 MiB allowance. Large inventories must explicitly increase the allowance and occurrence cap. This is a conservative admission calculation, not an OS-enforced RSS limit. Library/parser/TLS behaviour still requires measurement against the actual server.
+
+The disposable-server test transfers a 25 MiB message and records whole-process RSS and peak RSS; the seeded test and verification allocations are included. No actual IMAP memory measurement was available in the initial development environment because Docker was not running. Do not treat the budget estimate as measured proof.
+
+A separate synthetic-adapter smoke test did run at 25 MiB/concurrency one and measured about 219.7 MiB peak RSS. That is application-only evidence; see `TESTING.md` for exact measurements and remaining gaps.
+
+Read-side network errors have at most three attempts with exponential delay and jitter. Connections have configured connect/greeting/socket timeouts. There is no authentication retry loop or automatic reconnect. A failed mailbox pauses while independent mailbox pairs can finish. APPEND errors never use read retry logic. Cancellation stops new scheduling, settles the current bounded operation, leaves durable evidence or ambiguity, and returns incomplete/interrupted status. SIGKILL/power loss can leave a stale lock but never triggers a database reset.
+
+## Security and trust boundaries
+
+Source adapters expose read operations only; destination adapters add CREATE and APPEND, but no deletion, flag-store, rename or subscription methods. Messages are opaque bytes. HTML and attachments are never rendered. Reports contain IDs, folder names, sizes, hashes, flags and endpoints, but never subjects, bodies, passwords or protocol transcripts. Server exception strings are replaced with allow-listed categories; filenames use UUID/time identifiers. User-visible folder strings use React text escaping, and JSON escapes control characters.
+
+The web server binds only 127.0.0.1 and checks Host, Origin and a random session header. The session token arrives via the initial URL fragment, is removed from the visible URL and stays only in browser memory. Reopen the terminal link after a reload. No CORS, external scripts, fonts or analytics are used. CSP disallows embedded frames and external content. Credentials remain in the input form and backend RAM until session/process exit; JavaScript cannot promise zeroisation and OS swap/crash dumps are outside the app. HTTP is restricted to loopback; mailbox traffic always uses validated TLS. This is not a multi-user or remotely accessible web service.
+
+POSIX directories/files use 0700/0600. Windows needs inherited ACLs reviewed by the operator. Node chmod does not establish equivalent Windows ACL protection. The same-state lock protects only this application and directory; other clients, other state directories and OS users are outside its control. Use an encrypted local disk and keep private data out of sync/shared folders.
