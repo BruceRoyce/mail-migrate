@@ -201,11 +201,16 @@ program
   .command('web')
   .description('Start the localhost browser UI; credentials remain in server memory')
   .option('--port <number>', 'Loopback port', '8787')
+  .option(
+    '--host <address>',
+    'Listen address: 127.0.0.1, or 0.0.0.0 inside a local-only container',
+    '127.0.0.1',
+  )
   .option('--state-dir <path>', 'State directory', './private-migration-state')
   .option('--report-dir <path>', 'Report directory', './private-migration-reports')
   .action(async (o) => {
     const { startWeb } = await import('./server.js');
-    await startWeb(Number(o.port), resolve(o.stateDir), resolve(o.reportDir));
+    await startWeb(Number(o.port), resolve(o.stateDir), resolve(o.reportDir), o.host);
   });
 program.parseAsync().catch((e) => {
   output(errorPayload(e));

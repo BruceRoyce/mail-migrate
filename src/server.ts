@@ -365,12 +365,13 @@ export async function createWeb(
     isRunning: () => running || discovery?.status === 'running',
   };
 }
-export async function startWeb(port: number, state: string, reports: string) {
+export async function startWeb(port: number, state: string, reports: string, host = '127.0.0.1') {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Fault('invalid_port', 3);
+  if (host !== '127.0.0.1' && host !== '0.0.0.0') throw new Fault('invalid_listen_host', 3);
   const web = await createWeb(port, state, reports);
-  await web.app.listen({ host: '127.0.0.1', port });
+  await web.app.listen({ host, port });
   console.log(
-    `Open http://127.0.0.1:${port}/#${web.token}\nKeep this PowerShell window open. Treat this local session link as private.`,
+    `Open http://127.0.0.1:${port}/#${web.token}\nKeep this process running. Treat this local session link as private.`,
   );
   let stopping = false;
   const shutdown = () => {

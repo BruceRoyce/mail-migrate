@@ -40,7 +40,34 @@ Default directories are `private-migration-state` and `private-migration-reports
 node dist/cli.js web --state-dir C:\PrivateMail\state --report-dir C:\PrivateMail\reports --port 8787
 ```
 
-The local UI uses React/Vite and a Fastify backend bound exclusively to `127.0.0.1`. Credentials remain in browser form/backend memory, not browser persistent storage or SQLite. Password fields, RAM, process dumps and swap are not a secure vault. Protect the machine and private directories; see the [operator runbook](docs/RUNBOOK.md).
+The local UI uses React/Vite and a Fastify backend bound to `127.0.0.1` by default. Docker uses an explicit `--host 0.0.0.0` override inside the container with a loopback-only published port. Credentials remain in browser form/backend memory, not browser persistent storage or SQLite. Password fields, RAM, process dumps and swap are not a secure vault. Protect the machine and private directories; see the [operator runbook](docs/RUNBOOK.md).
+
+## Run with Docker
+
+The root Dockerfile uses `node:24`, builds the backend and browser assets, and runs the compiled app as the non-root `node` user with production dependencies only. The build context excludes local configuration, secrets, migration state, reports and Windows `node_modules`.
+
+Run these commands from the project directory (PowerShell or a Linux shell):
+
+```sh
+docker build -t email-migrator .
+docker volume create email-migrator-data
+docker run -d --name email-migrator --init --stop-timeout 120 -p 127.0.0.1:8787:8787 -v email-migrator-data:/data email-migrator
+docker logs email-migrator
+```
+
+Stop the native app first if it is using port 8787. Open the full private `http://127.0.0.1:8787/#…` link from the container logs on the Docker host. Use `127.0.0.1`, not `localhost`: the Host and Origin checks still require that exact address and port. Access from another computer requires an SSH tunnel forwarding port 8787 to the Docker host's loopback port; this deployment does not enable a public or LAN web service. Keep the host-side `127.0.0.1` in the port mapping.
+
+The named volume persists the SQLite ledger under `/data/state` and reports under `/data/reports`. Use one container per state volume. It starts with a separate empty ledger; it does not import an existing Windows migration automatically. For custom CA files, mount a separate directory read-only and enter the container path in the UI. Bind mounts used instead of the named volume must be writable by the image's `node` user (UID/GID 1000).
+
+```sh
+docker stop email-migrator
+docker start email-migrator
+docker logs email-migrator
+```
+
+Every process restart creates a new session link and clears in-memory mailbox credentials. Re-enter credentials, test connections and use the saved migration ID to resume. Stop gracefully before replacing the container; retain the named volume. A forced stop can leave a stale writer lock requiring investigation, especially after container replacement changes its hostname or process IDs. Never remove a lock while another process may still be using that ledger.
+
+The container launch uses Node directly and forwards termination signals through Docker's `--init`. The 120-second stop grace allows the current mail operation to settle; if it is forcibly terminated, recovery uses the durable ledger. The Docker image has not yet been built or run in this development environment because the Linux Docker daemon is unavailable.
 
 ## CLI: configuration, plan and dry run
 

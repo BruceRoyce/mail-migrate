@@ -1,0 +1,12 @@
+# Only application sources and dependency manifests enter the build context.
+# Excludes credentials, migration state, reports, Git, and host node_modules.
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!web/
+!web/**
