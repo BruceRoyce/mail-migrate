@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import { readFileSync, realpathSync, existsSync } from 'node:fs';
 import { resolve, dirname, parse as parsePath, relative, isAbsolute } from 'node:path';
-import { parse } from 'yaml';
+import { LineCounter, parseDocument } from 'yaml';
 import { canonical, hash, Fault } from './safety.js';
+import { validationIssues } from './validation.js';
 const safe = z
   .string()
   .min(1)
@@ -108,7 +109,7 @@ function physical(path: string): string {
 }
 export function validateConfig(data: unknown, base = process.cwd()): Config {
   const parsed = schema.safeParse(data);
-  if (!parsed.success) throw new Fault('invalid_configuration', 3);
+  if (!parsed.success) throw new Fault('invalid_configuration', 3, validationIssues(parsed.error));
   const c = parsed.data;
   c.stateDirectory = physical(resolve(base, c.stateDirectory));
   c.reportDirectory = physical(resolve(base, c.reportDirectory));
@@ -129,7 +130,12 @@ export function validateConfig(data: unknown, base = process.cwd()): Config {
     c.defaults.memoryBudgetMiB * 1024 * 1024 <
     192 * 1024 * 1024 + 6 * c.defaults.maxMessageBytes + 16384 * c.defaults.maxOccurrences
   )
-    throw new Fault('memory_budget_too_small', 3);
+    throw new Fault('memory_budget_too_small', 3, [
+      {
+        path: 'config.defaults.memoryBudgetMiB',
+        message: `The selected limits require at least ${Math.ceil((192 * 1024 * 1024 + 6 * c.defaults.maxMessageBytes + 16384 * c.defaults.maxOccurrences) / (1024 * 1024))} MiB. Increase the memory allowance or lower the message/inventory ceilings.`,
+      },
+    ]);
   const ids = new Set<string>(),
     targets = new Set<string>(),
     sources = new Set<string>();
@@ -157,12 +163,48 @@ export function validateConfig(data: unknown, base = process.cwd()): Config {
   return c;
 }
 export function loadConfig(path: string): Config {
+  let text: string;
   try {
-    return validateConfig(parse(readFileSync(path, 'utf8')), dirname(resolve(path)));
+    text = readFileSync(path, 'utf8');
   } catch (e) {
-    if (e instanceof Fault) throw e;
-    throw new Fault('invalid_configuration', 3);
+    const missing = (e as NodeJS.ErrnoException).code === 'ENOENT';
+    throw new Fault(missing ? 'configuration_file_not_found' : 'configuration_file_unreadable', 3, [
+      {
+        path: 'config',
+        message: missing
+          ? 'The --config file was not found. Relative paths start at the current PowerShell working directory; use an absolute path if needed.'
+          : 'The --config file could not be read. Check that it is a file and that your account has read access.',
+      },
+    ]);
   }
+  const lineCounter = new LineCounter();
+  const doc = parseDocument(text, { prettyErrors: false, lineCounter });
+  if (doc.errors.length)
+    throw new Fault(
+      'invalid_configuration',
+      3,
+      doc.errors.map((error) => {
+        const { line, col } = lineCounter.linePos(error.pos[0]);
+        return {
+          path: `config (line ${line}, column ${col})`,
+          message:
+            'Invalid YAML syntax. Check indentation, quotes and duplicate keys here; compare with migration.example.yaml.',
+        };
+      }),
+    );
+  let data: unknown;
+  try {
+    data = doc.toJS();
+  } catch {
+    throw new Fault('invalid_configuration', 3, [
+      {
+        path: 'config',
+        message:
+          'Could not read YAML values. Use ordinary mappings and lists without recursive aliases.',
+      },
+    ]);
+  }
+  return validateConfig(data, dirname(resolve(path)));
 }
 export function fingerprint(c: Config): string {
   return hash(

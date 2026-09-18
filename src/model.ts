@@ -1,4 +1,11 @@
 export type Meta = { uid: string; size: number; date: string | null; flags: string[] };
+export type ScanProgress = {
+  phase: 'searching' | 'fetching';
+  scanned: number;
+  total?: number;
+  bytes: number;
+};
+export type ScanControl = { signal?: AbortSignal; progress?: (value: ScanProgress) => void };
 export type Folder = {
   path: string;
   delimiter: string;
@@ -84,7 +91,7 @@ export interface Reader {
   close(): Promise<void>;
   list(): Promise<Folder[]>;
   open(folder: string): Promise<View>;
-  scan(boundary: string, ceiling: number, from?: string): Promise<Meta[]>;
+  scan(boundary: string, ceiling: number, from?: string, control?: ScanControl): Promise<Meta[]>;
   meta(uid: string): Promise<Meta | null>;
   raw(uid: string, ceiling: number): Promise<Buffer>;
   capabilities(): string[];

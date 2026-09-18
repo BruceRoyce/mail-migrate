@@ -8,7 +8,7 @@ import { makePlan, checkPlan } from './plan.js';
 import { imapFactory } from './transport.js';
 import { Store, lock, unlock, privateDir, writePrivate } from './store.js';
 import { execute, report, resolveItem } from './engine.js';
-import { Fault, category } from './safety.js';
+import { Fault, errorPayload } from './safety.js';
 import type { Plan } from './model.js';
 
 const program = new Command()
@@ -208,6 +208,6 @@ program
     await startWeb(Number(o.port), resolve(o.stateDir), resolve(o.reportDir));
   });
 program.parseAsync().catch((e) => {
-  output({ error: category(e) });
+  output(errorPayload(e));
   process.exitCode = e instanceof Fault ? e.exit : 4;
 });

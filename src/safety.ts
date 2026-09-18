@@ -15,13 +15,21 @@ export function canonical(value: unknown): string {
     );
   return JSON.stringify(value);
 }
+export type ValidationIssue = { path: string; message: string };
 export class Fault extends Error {
   constructor(
     public category: string,
     public exit = 2,
+    public issues?: ValidationIssue[],
   ) {
     super(category);
   }
+}
+export function errorPayload(error: unknown): { error: string; issues?: ValidationIssue[] } {
+  return {
+    error: category(error),
+    ...(error instanceof Fault && error.issues ? { issues: error.issues } : {}),
+  };
 }
 export function category(error: unknown): string {
   if (error instanceof Fault) return error.category;

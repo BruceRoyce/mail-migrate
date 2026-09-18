@@ -155,6 +155,7 @@ fieldset {
   overflow-wrap: anywhere;
 }
 .error {
+  white-space: pre-line;
   background: #fff0ed;
   color: #9b3026;
 }
@@ -204,6 +205,22 @@ summary {
 .progress {
   font-size: 13px;
   line-height: 1.8;
+}
+.discovery-status {
+  padding: 18px;
+  margin: 18px 0;
+  background: #edf6f3;
+  border: 1px solid #b8d6cb;
+  border-radius: 8px;
+}
+.discovery-status p {
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+.discovery-status progress {
+  width: 100%;
+  height: 12px;
+  accent-color: #175e50;
 }
 footer {
   text-align: center;

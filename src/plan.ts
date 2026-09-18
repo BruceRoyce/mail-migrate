@@ -3,6 +3,7 @@ import { type Config, type Endpoint, fingerprint, identity } from './config.js';
 import { hash, canonical, Fault } from './safety.js';
 import type { Folder, Mapping, Plan, Reader } from './model.js';
 import type { Factory } from './transport.js';
+import { DiscoveryControl, type DiscoveryOptions, type DiscoveryProgress } from './discovery.js';
 export function mappings(
   source: Folder[],
   destination: Folder[],
@@ -85,6 +86,7 @@ export async function makePlan(
   factory: Factory,
   scope: Plan['scope'] = {},
   migration: string = randomUUID(),
+  options: DiscoveryOptions = {},
 ): Promise<Plan> {
   if (scope.mailbox && !c.mailboxes.some((m) => m.id === scope.mailbox))
     throw new Fault('unknown_mailbox', 3);
@@ -108,54 +110,130 @@ export async function makePlan(
   };
   let remaining = c.defaults.maxOccurrences,
     pilot = scope.pilot ?? Infinity;
-  for (const m of c.mailboxes.filter((m) => !scope.mailbox || m.id === scope.mailbox)) {
-    const s = factory(m.source, values.get(m.source)!, false, c),
-      d = factory(m.destination, values.get(m.destination)!, false, c);
-    try {
-      await s.connect();
-      await d.connect();
-      const sf = await s.list(),
-        df = await d.list();
-      const map = mappings(sf, df, m.folders, c.defaults.includeSpamAndTrash);
-      if (
-        (s.capabilities().includes('X-GM-EXT-1') ||
-          sf.some((f) => ['\\All', '\\Flagged'].includes(f.special ?? ''))) &&
-        m.folders.labelStrategy !== 'explicit-folders'
-      )
-        p.blockers.push(m.id + ':explicit_label_strategy_required');
-      for (const f of map) {
-        if (f.excluded) continue;
-        const v = await s.open(f.source.path);
-        f.source.validity = v.validity;
-        f.boundary = String(BigInt(v.next) - 1n);
-        const messages = await s.scan(f.boundary, remaining);
-        remaining -= messages.length;
-        f.bytes = messages.reduce((n, m) => n + m.size, 0);
-        f.messages = messages.slice(0, pilot);
-        pilot -= f.messages.length;
-        f.oversized = f.messages.filter(
-          (msg) => msg.size > Math.min(c.defaults.maxMessageBytes, d.appendLimit() ?? Infinity),
-        ).length;
-        f.source.count = messages.length;
+  const control = new DiscoveryControl(
+    options.operationTimeoutMs ?? c.defaults.timeoutSeconds * 1000,
+    options.signal,
+  );
+  let progress: DiscoveryProgress = {
+    phase: 'starting',
+    foldersDone: 0,
+    foldersTotal: 0,
+    messages: 0,
+    bytes: 0,
+    folderScanned: 0,
+  };
+  const emit = (next: Partial<DiscoveryProgress>) => {
+    control.check();
+    progress = { ...progress, ...next };
+    control.touch();
+    options.progress?.({ ...progress });
+  };
+  try {
+    for (const m of c.mailboxes.filter((m) => !scope.mailbox || m.id === scope.mailbox)) {
+      control.check();
+      const s = factory(m.source, values.get(m.source)!, false, c),
+        d = factory(m.destination, values.get(m.destination)!, false, c);
+      control.add(s);
+      control.add(d);
+      try {
+        emit({
+          phase: 'connecting_source',
+          mailbox: m.id,
+          folder: undefined,
+          folderScanned: 0,
+          folderMessages: undefined,
+        });
+        await control.read(() => s.connect());
+        emit({ phase: 'connecting_destination' });
+        await control.read(() => d.connect());
+        emit({ phase: 'listing_source' });
+        const sf = await control.read(() => s.list());
+        emit({ phase: 'listing_destination' });
+        const df = await control.read(() => d.list());
+        const map = mappings(sf, df, m.folders, c.defaults.includeSpamAndTrash);
+        emit({ foldersTotal: progress.foldersTotal + map.filter((f) => !f.excluded).length });
+        if (
+          (s.capabilities().includes('X-GM-EXT-1') ||
+            sf.some((f) => ['\\All', '\\Flagged'].includes(f.special ?? ''))) &&
+          m.folders.labelStrategy !== 'explicit-folders'
+        )
+          p.blockers.push(m.id + ':explicit_label_strategy_required');
+        for (const f of map) {
+          if (f.excluded) continue;
+          emit({
+            phase: 'opening_folder',
+            folder: f.source.path,
+            folderScanned: 0,
+            folderMessages: f.source.count,
+          });
+          const v = await control.read(() => s.open(f.source.path));
+          f.source.validity = v.validity;
+          f.boundary = String(BigInt(v.next) - 1n);
+          if (v.count > remaining)
+            throw new Fault('occurrence_ceiling', 3, [
+              {
+                path: 'config.defaults.maxOccurrences',
+                message:
+                  'The observed folder count exceeds the remaining inventory allowance. Increase the inventory ceiling and memory allowance together, or explicitly exclude folders before retrying. A pilot still inventories the full selected folder scope.',
+              },
+            ]);
+          const scannedBefore = progress.messages,
+            bytesBefore = progress.bytes;
+          emit({ phase: 'searching', folderMessages: v.count });
+          const messages = await control.read(() =>
+            s.scan(f.boundary!, remaining, '1', {
+              signal: control.signal,
+              progress: (value) =>
+                emit({
+                  phase: value.phase,
+                  folderScanned: value.scanned,
+                  folderMessages: value.total ?? v.count,
+                  messages: scannedBefore + value.scanned,
+                  bytes: bytesBefore + value.bytes,
+                }),
+            }),
+          );
+          const after = await control.read(() => s.open(f.source.path));
+          if (after.validity !== v.validity) throw new Fault('source_uidvalidity_changed');
+          remaining -= messages.length;
+          f.bytes = messages.reduce((n, m) => n + m.size, 0);
+          f.messages = messages.slice(0, pilot);
+          pilot -= f.messages.length;
+          f.oversized = f.messages.filter(
+            (msg) => msg.size > Math.min(c.defaults.maxMessageBytes, d.appendLimit() ?? Infinity),
+          ).length;
+          f.source.count = messages.length;
+          emit({
+            foldersDone: progress.foldersDone + 1,
+            messages: scannedBefore + messages.length,
+            bytes: bytesBefore + f.bytes,
+            folderScanned: messages.length,
+          });
+        }
+        emit({ phase: 'quota', folder: undefined, folderScanned: 0, folderMessages: undefined });
+        p.pairs.push({
+          id: m.id,
+          source: identity(m.source),
+          destination: identity(m.destination),
+          mappings: map,
+          capabilities: { source: s.capabilities(), destination: d.capabilities() },
+          quota: await control.read(() => d.quota()),
+          appendLimit: d.appendLimit(),
+          warnings: [
+            'endpoint_alias_identity_unconfirmed',
+            'no_future_delivery_guarantee',
+            ...(scope.pilot ? ['pilot_excludes_remaining_occurrences'] : []),
+          ],
+        });
+      } finally {
+        await Promise.allSettled([s.close(), d.close()]);
+        control.remove(s);
+        control.remove(d);
       }
-      p.pairs.push({
-        id: m.id,
-        source: identity(m.source),
-        destination: identity(m.destination),
-        mappings: map,
-        capabilities: { source: s.capabilities(), destination: d.capabilities() },
-        quota: await d.quota(),
-        appendLimit: d.appendLimit(),
-        warnings: [
-          'endpoint_alias_identity_unconfirmed',
-          'no_future_delivery_guarantee',
-          ...(scope.pilot ? ['pilot_excludes_remaining_occurrences'] : []),
-        ],
-      });
-    } finally {
-      await s.close();
-      await d.close();
     }
+    emit({ phase: 'complete' });
+    return seal(p);
+  } finally {
+    control.dispose();
   }
-  return seal(p);
 }

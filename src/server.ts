@@ -10,8 +10,10 @@ import { makePlan, checkPlan } from './plan.js';
 import { imapFactory, type Factory } from './transport.js';
 import { Store, lock, privateDir, writePrivate } from './store.js';
 import { execute, report, resolveItem, type Progress } from './engine.js';
-import { Fault, category } from './safety.js';
+import { Fault, category, errorPayload } from './safety.js';
+import { validationIssues } from './validation.js';
 import type { Plan } from './model.js';
+import type { Discovery } from './discovery.js';
 
 const inputEndpoint = z
   .object({
@@ -70,6 +72,15 @@ export async function createWeb(
     lastReport: unknown,
     error: string | undefined;
   let progress: Progress[] = [];
+  let discovery: Discovery | undefined;
+  let discoveryController: AbortController | undefined;
+  const cancel = () => {
+    cancelled = true;
+    if (discovery?.status === 'running') {
+      discovery = { ...discovery, phase: 'cancelling', updatedAt: new Date().toISOString() };
+      discoveryController?.abort();
+    }
+  };
   let setupRequest: string | undefined;
   app.addHook('onRequest', async (req, reply) => {
     reply
@@ -97,16 +108,30 @@ export async function createWeb(
     if (setupRequest === req.id) setupRequest = undefined;
   });
   app.setErrorHandler((e, _req, reply) => {
-    reply.code(e instanceof Fault ? 400 : 500).send({ error: category(e) });
+    if (e instanceof z.ZodError) {
+      reply
+        .code(400)
+        .send(errorPayload(new Fault('invalid_request', 3, validationIssues(e, 'request'))));
+      return;
+    }
+    reply.code(e instanceof Fault ? 400 : 500).send(errorPayload(e));
   });
   const idle = () => {
     if (running) throw new Fault('migration_running');
+    if (discovery?.status === 'running') throw new Fault('discovery_running');
   };
   const ready = () => {
     if (!config || !values) throw new Fault('test_connections_first');
     return { c: config, v: values };
   };
-  app.get('/api/session', async () => ({ running, plan, report: lastReport, error, progress }));
+  app.get('/api/session', async () => ({
+    running,
+    plan,
+    report: lastReport,
+    error,
+    progress,
+    discovery,
+  }));
   app.post('/api/test', async (req) => {
     idle();
     config = undefined;
@@ -114,8 +139,11 @@ export async function createWeb(
     plan = undefined;
     error = undefined;
     lastReport = undefined;
+    progress = [];
+    discovery = undefined;
     const parsed = setup.safeParse(req.body);
-    if (!parsed.success) throw new Fault('invalid_connection_form', 3);
+    if (!parsed.success)
+      throw new Fault('invalid_connection_form', 3, validationIssues(parsed.error, 'form'));
     const body = parsed.data;
     const c = validateConfig({
       version: 1,
@@ -157,7 +185,7 @@ export async function createWeb(
     }
     return { results, ready: !!config };
   });
-  app.post('/api/plan', async (req) => {
+  app.post('/api/plan', async (req, reply) => {
     idle();
     const { c, v } = ready();
     const scope = z
@@ -168,14 +196,49 @@ export async function createWeb(
       })
       .strict()
       .parse(req.body ?? {});
-    plan = await makePlan(
-      c,
-      v,
-      factory,
-      { pilot: scope.pilot, mailbox: scope.mailbox },
-      scope.migration,
-    );
-    return plan;
+    plan = undefined;
+    error = undefined;
+    const now = new Date().toISOString();
+    discovery = {
+      status: 'running',
+      phase: 'starting',
+      startedAt: now,
+      updatedAt: now,
+      foldersDone: 0,
+      foldersTotal: 0,
+      messages: 0,
+      bytes: 0,
+      folderScanned: 0,
+    };
+    discoveryController = new AbortController();
+    void makePlan(c, v, factory, { pilot: scope.pilot, mailbox: scope.mailbox }, scope.migration, {
+      signal: discoveryController.signal,
+      progress: (value) => {
+        discovery = { ...discovery!, ...value, updatedAt: new Date().toISOString() };
+      },
+    })
+      .then((result) => {
+        plan = result;
+        discovery = {
+          ...discovery!,
+          status: 'complete',
+          phase: 'complete',
+          finishedAt: new Date().toISOString(),
+        };
+      })
+      .catch((e) => {
+        const reason = category(e);
+        discovery = {
+          ...discovery!,
+          status: reason === 'discovery_cancelled' ? 'cancelled' : 'failed',
+          error: reason,
+          finishedAt: new Date().toISOString(),
+        };
+      })
+      .finally(() => {
+        discoveryController = undefined;
+      });
+    return reply.code(202).send({ discovery });
   });
   app.post('/api/run', async (req) => {
     idle();
@@ -277,7 +340,7 @@ export async function createWeb(
     }
   });
   app.post('/api/cancel', async () => {
-    cancelled = true;
+    cancel();
     return { cancellationRequested: true };
   });
   app.get('/api/report', async (_req, reply) => {
@@ -298,10 +361,8 @@ export async function createWeb(
   return {
     app,
     token,
-    cancel: () => {
-      cancelled = true;
-    },
-    isRunning: () => running,
+    cancel,
+    isRunning: () => running || discovery?.status === 'running',
   };
 }
 export async function startWeb(port: number, state: string, reports: string) {

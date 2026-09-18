@@ -16,7 +16,11 @@ npm run build
 npm run web
 ```
 
-Open the **private localhost session link printed in PowerShell**. Keep that terminal running. The link is a capability for this local session; do not share it. The UI removes its token from the address bar. After a browser reload, reopen the original terminal link.
+Open the **private localhost session link printed in PowerShell**, including the full `#…` suffix. Keep that terminal running. The link is a capability for this local session; do not share it. The UI removes its token from the address bar and keeps only that local access token in the tab's session storage, so refreshing retains access while the same backend is running. Mailbox settings and passwords are never saved in browser storage and must be re-entered after a page reload.
+
+If the backend restarts, its old session links expire. The page will show **Reconnect to the local app**: paste the new full PowerShell link there and choose **Reconnect this tab**. This preserves existing form entries and only reconnects the local UI—it does not test mailboxes or start a migration. You can also reopen the new link directly. Opening the bare address without its suffix in a fresh tab requires this reconnect step.
+
+The browser form uses its own entries; it does **not** load `migration.yaml`. That file is for CLI commands. Validation errors now identify the failing field and explain the expected format without displaying entered values. A mailbox identifier is a short label such as `support`, not an email address; put the account address in Username. After updating the application, rebuild it and restart the backend before reopening its session link.
 
 1. Enter separate source and destination hostnames, ports, TLS modes, usernames and passwords. Add mailbox pairs as needed. No real provider hostnames or credentials are built in.
 2. Click **Test both connections**. Both must pass before discovery is enabled.
@@ -25,6 +29,10 @@ Open the **private localhost session link printed in PowerShell**. Keep that ter
 5. Inspect verified/unresolved outcomes and download the private report. Retain the migration ID and state directory for resume and catch-up. After restarting, re-enter the same settings and credentials, test connections, enter the migration ID and click **Load saved migration**.
 
 For catch-up, enter the saved migration ID and click **Discover folders & build plan**, then confirm the new plan. Clear any pilot limit for a full pass. The UI also supports read-only reverification and explicit linking of ambiguous destination UIDs. Advanced pre-append retry is available through the CLI.
+
+Discovery starts as a background read-only job. The plan review section immediately shows activity, the current mailbox/folder, inventoried message counts, estimated bytes and elapsed time. **Cancel discovery** closes the discovery connections and discards partial results; you can retry. A stalled discovery read stops after the configured `timeoutSeconds` (60 seconds by default); completed metadata batches renew that deadline. A failed or cancelled discovery never enables migration approval. Restart the backend after updating the application to use this workflow.
+
+Large, sparsely numbered mailboxes are searched using the selected folder's count to bound the UID response; message metadata is then fetched in groups of at most 250 UIDs. An inventory above the configured occurrence ceiling fails explicitly before an unbounded scan. A pilot limits copying, not the inventory needed to review the selected folders; raise the inventory and memory allowances together or exclude folders explicitly.
 
 Default directories are `private-migration-state` and `private-migration-reports` beneath the launch directory. Override them with:
 
@@ -155,4 +163,5 @@ It verifies MIME fixtures, duplicate occurrences, unrelated destination mail, so
 See [architecture and recovery policy](docs/ARCHITECTURE.md), [operator runbook](docs/RUNBOOK.md), [test evidence](docs/TESTING.md), and [synthetic reports](docs/samples/).
 
 Before a live migration, the owner still needs to confirm provider endpoints/authentication, mailbox mappings versus aliases, provisioning, volumes/largest messages/quotas, active-user behaviour, folder scope and DNS/cutover ownership. **Building this application does not authorise operating on real mailboxes.**
+
 # mail-migrate

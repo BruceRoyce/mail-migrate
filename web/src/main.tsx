@@ -1,6 +1,14 @@
 import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
+import {
+  getSessionToken,
+  setSessionToken,
+  SessionExpired,
+  rejectSession,
+  tokenFromLink,
+  takeFragment,
+} from './session';
 type Endpoint = {
   host: string;
   port: number;
@@ -66,10 +74,27 @@ type Session = {
   report?: Report;
   error?: string;
   progress: { mailbox: string; item: string; state: string }[];
+  discovery?: Discovery;
 };
-const token = location.hash.slice(1);
-history.replaceState(null, '', location.pathname);
+type Discovery = {
+  status: 'running' | 'complete' | 'failed' | 'cancelled';
+  phase: string;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  mailbox?: string;
+  folder?: string;
+  foldersDone: number;
+  foldersTotal: number;
+  messages: number;
+  bytes: number;
+  folderScanned: number;
+  folderMessages?: number;
+  error?: string;
+};
 async function api<T>(path: string, body?: unknown): Promise<T> {
+  const token = getSessionToken();
+  if (!token) throw new SessionExpired();
   const r = await fetch('/api/' + path, {
     method: body === undefined ? 'GET' : 'POST',
     headers: {
@@ -77,9 +102,18 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
       ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: ['session', 'plan', 'cancel'].includes(path) ? AbortSignal.timeout(15000) : undefined,
   });
   const data = await r.json();
-  if (!r.ok) throw new Error(data.error ?? 'request_failed');
+  if (!r.ok && data.error === 'session_rejected') throw rejectSession(token);
+  if (!r.ok) {
+    const details = Array.isArray(data.issues)
+      ? data.issues
+          .map((issue: { path: string; message: string }) => `${issue.path}: ${issue.message}`)
+          .join('\n')
+      : '';
+    throw new Error(details || data.error || 'request_failed');
+  }
   return data as T;
 }
 const endpoint = (): Endpoint => ({
@@ -110,44 +144,80 @@ function App() {
     [limit, setLimit] = useState(25),
     [budget, setBudget] = useState(512),
     [maxOccurrences, setMaxOccurrences] = useState(5000),
-    [overrideDrafts, setOverrideDrafts] = useState<Record<number, string>>({});
+    [overrideDrafts, setOverrideDrafts] = useState<Record<number, string>>({}),
+    [needsSession, setNeedsSession] = useState(!getSessionToken()),
+    [sessionLink, setSessionLink] = useState(''),
+    [sessionRevision, setSessionRevision] = useState(0),
+    [startingPlan, setStartingPlan] = useState(false),
+    [discoveryError, setDiscoveryError] = useState('');
   const plan = session.plan,
     report = session.report;
-  const disabled = busy || session.running;
+  const discovering = startingPlan || session.discovery?.status === 'running';
+  const disabled = busy || session.running || needsSession || discovering;
+  function handleFailure(e: unknown) {
+    if (e instanceof SessionExpired) {
+      if (e.obsolete) return;
+      setNeedsSession(true);
+      setReady(false);
+      setConfirm(false);
+      setError('');
+    } else setError((e as Error).message);
+  }
   const perform = async (fn: () => Promise<void>) => {
     setBusy(true);
     setError('');
     try {
       await fn();
     } catch (e) {
-      setError((e as Error).message);
+      handleFailure(e);
     } finally {
       setBusy(false);
     }
   };
   useEffect(() => {
-    if (!token) {
-      setError(
-        'Open the private session link printed in PowerShell. Refreshing requires opening that link again.',
-      );
+    if (needsSession || !getSessionToken()) {
       return;
     }
     let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = () => {
       api<Session>('session')
         .then((s) => {
           if (live) setSession(s);
         })
         .catch((e) => {
-          if (live) setError(e.message);
+          if (live) handleFailure(e);
+        })
+        .finally(() => {
+          if (live) timer = setTimeout(poll, 1000);
         });
     };
     poll();
-    const timer = setInterval(poll, 1000);
     return () => {
       live = false;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
+  }, [needsSession, sessionRevision]);
+  async function reconnect(link: string) {
+    const candidate = tokenFromLink(link);
+    setSessionToken(candidate);
+    const current = await api<Session>('session');
+    setSession(current);
+    setNeedsSession(false);
+    setSessionLink('');
+    setError('');
+    setReady(false);
+    setConfirm(false);
+    setTests([]);
+    setSessionRevision((n) => n + 1);
+  }
+  useEffect(() => {
+    const onFragment = () => {
+      const value = takeFragment();
+      if (value !== undefined) void perform(() => reconnect(value));
+    };
+    window.addEventListener('hashchange', onFragment);
+    return () => window.removeEventListener('hashchange', onFragment);
   }, []);
   function edit(index: number, change: Partial<Pair>) {
     setPairs((old) => old.map((p, i) => (i === index ? { ...p, ...change } : p)));
@@ -181,6 +251,36 @@ function App() {
         <span>3 · Confirm</span>
         <span>4 · Verify</span>
       </nav>
+      {needsSession && (
+        <section aria-labelledby="session-heading">
+          <h2 id="session-heading">Reconnect to the local app</h2>
+          <p>
+            The session is missing or has expired, usually because the backend restarted. Your
+            current form entries are still here.
+          </p>
+          <p>
+            Paste the full private link printed in the current PowerShell window, including the part
+            after #. Keep this link private.
+          </p>
+          <label>
+            Private session link from PowerShell
+            <input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={sessionLink}
+              onChange={(e) => setSessionLink(e.target.value)}
+            />
+          </label>
+          <button
+            disabled={busy || !sessionLink.trim()}
+            onClick={() => void perform(() => reconnect(sessionLink))}
+          >
+            Reconnect this tab
+          </button>
+          <p>Reconnecting does not contact mail servers or start a migration.</p>
+        </section>
+      )}
       {(error || session.error) && (
         <div role="alert" className="error">
           {error || session.error}
@@ -191,6 +291,10 @@ function App() {
         <p>
           Credentials stay in the local backend’s memory. No mailbox passwords are saved to disk.
           Use an app password if required by your provider.
+        </p>
+        <p>
+          This form uses the settings entered below. It does not load migration.yaml; that file is
+          used by CLI commands.
         </p>
         <fieldset disabled={disabled}>
           <legend className="sr-only">Connection settings</legend>
@@ -204,6 +308,9 @@ function App() {
                     value={p.id}
                     onChange={(e) => edit(index, { id: e.target.value })}
                   />
+                  <small>
+                    Short label, e.g. support. Letters, digits, underscores and hyphens only.
+                  </small>
                 </label>
                 {pairs.length > 1 && (
                   <button
@@ -475,16 +582,35 @@ function App() {
             disabled={!ready || disabled}
             onClick={() =>
               void perform(async () => {
-                const p = await api<Plan>('plan', {
-                  ...(pilot ? { pilot: Number(pilot) } : {}),
-                  ...(migration ? { migration } : {}),
-                });
-                setSession((s) => ({ ...s, plan: p, report: undefined }));
+                setStartingPlan(true);
                 setConfirm(false);
+                setDiscoveryError('');
+                setSession((s) => ({ ...s, plan: undefined, discovery: undefined }));
+                try {
+                  const result = await api<{ discovery: Discovery }>('plan', {
+                    ...(pilot ? { pilot: Number(pilot) } : {}),
+                    ...(migration ? { migration } : {}),
+                  });
+                  setSession((s) => ({
+                    ...s,
+                    discovery: result.discovery,
+                    plan: undefined,
+                    report: undefined,
+                  }));
+                } catch (e) {
+                  setDiscoveryError(
+                    e instanceof SessionExpired
+                      ? 'Reconnect to the local app before retrying discovery.'
+                      : (e as Error).message,
+                  );
+                  throw e;
+                } finally {
+                  setStartingPlan(false);
+                }
               })
             }
           >
-            Discover folders &amp; build plan
+            {discovering ? 'Discovering folders…' : 'Discover folders & build plan'}
           </button>
           <button
             className="secondary"
@@ -500,6 +626,30 @@ function App() {
             Load saved migration
           </button>
         </div>
+        {discoveryError && (
+          <p role="alert" className="error">
+            {discoveryError}
+          </p>
+        )}
+        {(startingPlan || session.discovery) && (
+          <DiscoveryStatus
+            value={session.discovery}
+            starting={startingPlan}
+            cancelDisabled={busy || needsSession}
+            onCancel={() =>
+              void perform(async () => {
+                await api('cancel', {});
+                setSession((s) => ({
+                  ...s,
+                  discovery:
+                    s.discovery?.status === 'running'
+                      ? { ...s.discovery, phase: 'cancelling' }
+                      : s.discovery,
+                }));
+              })
+            }
+          />
+        )}
         {plan && (
           <>
             <p className="mono">
@@ -634,11 +784,13 @@ function App() {
       <section>
         <h2>4. Progress &amp; evidence</h2>
         <p aria-live="polite">
-          {session.running
-            ? 'Migration running. Keep the PowerShell backend open.'
-            : busy
-              ? 'Working…'
-              : 'Ready.'}
+          {discovering
+            ? 'Discovering folders. See progress in the plan review above.'
+            : session.running
+              ? 'Migration running. Keep the PowerShell backend open.'
+              : busy
+                ? 'Working…'
+                : 'Ready.'}
         </p>
         <ul className="progress">
           {session.progress.slice(-8).map((p, i) => (
@@ -726,6 +878,119 @@ function App() {
     </main>
   );
 }
+function DiscoveryStatus({
+  value,
+  starting,
+  onCancel,
+  cancelDisabled,
+}: {
+  value?: Discovery;
+  starting: boolean;
+  onCancel: () => void;
+  cancelDisabled: boolean;
+}) {
+  const [now, setNow] = useState(Date.now());
+  const active = starting || value?.status === 'running';
+  useEffect(() => {
+    if (!active) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [active]);
+  const phases: Record<string, string> = {
+    starting: 'Starting discovery',
+    connecting_source: 'Connecting to the source host',
+    connecting_destination: 'Connecting to the destination host',
+    listing_source: 'Listing source folders',
+    listing_destination: 'Listing destination folders',
+    opening_folder: 'Opening source folder',
+    searching: 'Finding message UIDs',
+    fetching: 'Reading message metadata',
+    quota: 'Checking destination quota',
+    complete: 'Discovery complete',
+    cancelling: 'Cancelling discovery',
+  };
+  const problems: Record<string, string> = {
+    discovery_timeout:
+      'Discovery stopped because a read made no progress before its timeout. Check the connection and retry.',
+    occurrence_ceiling:
+      'This inventory exceeds the configured occurrence ceiling. Increase the inventory ceiling and memory allowance together, or exclude folders. A pilot still inventories all selected folders.',
+    source_uidvalidity_changed:
+      'The source folder identity changed during discovery. Rebuild the plan before proceeding.',
+  };
+  const elapsed = value
+    ? Math.max(
+        0,
+        Math.floor(
+          ((value.finishedAt ? Date.parse(value.finishedAt) : now) - Date.parse(value.startedAt)) /
+            1000,
+        ),
+      )
+    : 0;
+  return (
+    <div className="discovery-status" aria-label="Folder discovery progress">
+      <div role="status" aria-live="polite">
+        <strong>
+          {starting
+            ? 'Starting discovery…'
+            : value?.status === 'cancelled'
+              ? 'Discovery cancelled'
+              : value?.status === 'failed'
+                ? 'Discovery failed'
+                : (phases[value?.phase ?? 'starting'] ?? 'Discovering folders')}
+        </strong>
+        {value?.mailbox && (
+          <p>
+            {value.mailbox}
+            {value.folder ? ` · ${value.folder}` : ''}
+          </p>
+        )}
+        {value && (
+          <p>
+            {value.foldersDone} / {value.foldersTotal || 'unknown'} folders scanned ·{' '}
+            {value.messages.toLocaleString()} messages inventoried · {value.bytes.toLocaleString()}{' '}
+            estimated bytes
+          </p>
+        )}
+        {value?.folderMessages !== undefined && active && (
+          <p>
+            Current folder: {value.folderScanned.toLocaleString()} /{' '}
+            {value.folderMessages.toLocaleString()} messages
+          </p>
+        )}
+      </div>
+      {active && (
+        <progress
+          aria-label="Folders scanned"
+          max={value?.foldersTotal || 1}
+          value={value?.foldersTotal ? value.foldersDone : undefined}
+        />
+      )}
+      <p>
+        {elapsed}s elapsed. Discovery reads folder information and message metadata; it does not
+        copy mail.
+      </p>
+      {value?.status === 'failed' && (
+        <p role="alert" className="error">
+          {problems[value.error ?? ''] ??
+            `Discovery could not finish (${value.error ?? 'unknown error'}). Check the connection settings and retry.`}
+        </p>
+      )}
+      {value?.status === 'cancelled' && (
+        <p>No partial plan will be used. You can retry discovery.</p>
+      )}
+      {active && (
+        <button
+          className="secondary"
+          disabled={starting || cancelDisabled || value?.phase === 'cancelling'}
+          onClick={onCancel}
+        >
+          {value?.phase === 'cancelling' ? 'Cancelling…' : 'Cancel discovery'}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function Resolution({
   item,
   candidates,

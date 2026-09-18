@@ -1,7 +1,7 @@
-import { ImapFlow } from 'imapflow';
+import { ImapFlow, type FetchMessageObject } from 'imapflow';
 import { readFileSync } from 'node:fs';
 import type { Config, Endpoint } from './config.js';
-import type { Reader, Writer, Folder, View, Meta } from './model.js';
+import type { Reader, Writer, Folder, View, Meta, ScanControl } from './model.js';
 import { Fault } from './safety.js';
 export type Factory = (
   endpoint: Endpoint,
@@ -71,27 +71,77 @@ export class ImapReader implements Reader {
       count: m.exists,
     };
   }
-  async scan(boundary: string, ceiling: number, from = '1'): Promise<Meta[]> {
+  async scan(
+    boundary: string,
+    ceiling: number,
+    from = '1',
+    control: ScanControl = {},
+  ): Promise<Meta[]> {
     const end = Number(boundary);
     if (!Number.isSafeInteger(end) || end < 0 || end > 4294967295) throw new Fault('invalid_uid');
     if (!/^\d+$/.test(from) || Number(from) < 1 || Number(from) > 4294967296)
       throw new Fault('invalid_uid');
     const result: Meta[] = [];
-    // UID ranges bound each response, including sparse folders. No nested commands in fetch iterators.
-    for (let low = Number(from); low <= end; low += 10000) {
-      const uids = await this.client.search(
-        { uid: `${low}:${Math.min(end, low + 9999)}` },
-        { uid: true },
-      );
+    let bytes = 0;
+    const check = () => control.signal?.throwIfAborted();
+    check();
+    if (Number(from) > end) return result;
+    const mailbox = this.client.mailbox;
+    // An EXAMINE count bounds SEARCH memory even when UIDs are extremely sparse.
+    // Full planning above the configured ceiling fails before enumerating UIDs.
+    if (from === '1' && mailbox && mailbox.exists > ceiling) throw new Fault('occurrence_ceiling');
+    const window = mailbox && mailbox.exists <= ceiling ? end - Number(from) + 1 : 10000;
+    for (let low = Number(from); low <= end; low += window) {
+      check();
+      control.progress?.({ phase: 'searching', scanned: result.length, bytes });
+      const upper = Math.min(end, low + window - 1);
+      const uids = await this.client.search({ uid: `${low}:${upper}` }, { uid: true });
+      check();
       if (!Array.isArray(uids)) throw new Fault('search_failed');
       if (result.length + uids.length > ceiling) throw new Fault('occurrence_ceiling');
-      for (const uid of uids) {
-        if (uid < low || uid > Math.min(end, low + 9999)) throw new Fault('invalid_uid');
-        const m = await this.meta(String(uid));
-        result.push(m ?? { uid: String(uid), size: 0, date: null, flags: [] });
+      if (
+        new Set(uids).size !== uids.length ||
+        uids.some((uid) => !Number.isInteger(uid) || uid < low || uid > upper)
+      )
+        throw new Fault('invalid_uid');
+      uids.sort((a, b) => a - b);
+      const total = result.length + uids.length;
+      // UID FETCH in bounded groups replaces one network round trip per message.
+      // Never issue nested IMAP commands while the fetch iterator is active.
+      for (let start = 0; start < uids.length; start += 250) {
+        check();
+        const batch = uids.slice(start, start + 250),
+          wanted = new Set(batch),
+          found = new Map<number, Meta>();
+        control.progress?.({ phase: 'fetching', scanned: result.length, total, bytes });
+        for await (const message of this.client.fetch(
+          batch.join(','),
+          { uid: true, size: true, internalDate: true, flags: true },
+          { uid: true },
+        )) {
+          check();
+          if (!wanted.has(message.uid) || found.has(message.uid))
+            throw new Fault('unexpected_fetch_uid');
+          found.set(message.uid, this.metadata(message));
+        }
+        check();
+        for (const uid of batch) {
+          const meta = found.get(uid) ?? { uid: String(uid), size: 0, date: null, flags: [] };
+          result.push(meta);
+          bytes += meta.size;
+        }
+        control.progress?.({ phase: 'fetching', scanned: result.length, total, bytes });
       }
     }
     return result;
+  }
+  private metadata(m: FetchMessageObject): Meta {
+    return {
+      uid: String(m.uid),
+      size: m.size ?? 0,
+      date: m.internalDate ? new Date(m.internalDate).toISOString() : null,
+      flags: [...(m.flags ?? [])],
+    };
   }
   async meta(uid: string): Promise<Meta | null> {
     const m = await this.client.fetchOne(
@@ -101,12 +151,7 @@ export class ImapReader implements Reader {
     );
     if (!m) return null;
     if (String(m.uid) !== uid) throw new Fault('unexpected_fetch_uid');
-    return {
-      uid: String(m.uid),
-      size: m.size ?? 0,
-      date: m.internalDate ? new Date(m.internalDate).toISOString() : null,
-      flags: [...(m.flags ?? [])],
-    };
+    return this.metadata(m);
   }
   async raw(uid: string, ceiling: number): Promise<Buffer> {
     const m = await this.meta(uid);
