@@ -6,13 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { type Config, type Endpoint, validateConfig } from './config.js';
-import { makePlan, checkPlan } from './plan.js';
+import { discoverSnapshot, planFromSnapshot, checkPlan } from './plan.js';
 import { imapFactory, type Factory } from './transport.js';
 import { Store, lock, privateDir, writePrivate } from './store.js';
 import { execute, report, resolveItem, type Progress } from './engine.js';
 import { Fault, category, errorPayload } from './safety.js';
 import { validationIssues } from './validation.js';
-import type { Plan } from './model.js';
+import type { Plan, DiscoverySnapshot } from './model.js';
 import type { Discovery } from './discovery.js';
 
 const inputEndpoint = z
@@ -88,6 +88,7 @@ export async function createWeb(
     error: string | undefined;
   let progress: Progress[] = [];
   let discovery: Discovery | undefined;
+  let snapshot: DiscoverySnapshot | undefined;
   let discoveryController: AbortController | undefined;
   const cancel = () => {
     cancelled = true;
@@ -175,6 +176,7 @@ export async function createWeb(
     discovery,
     migrationId,
     recordedMigrationId,
+    snapshot: snapshot && { id: snapshot.id, created: snapshot.created },
   }));
   app.post('/api/test', async (req) => {
     idle();
@@ -185,6 +187,7 @@ export async function createWeb(
     lastReport = undefined;
     progress = [];
     discovery = undefined;
+    snapshot = undefined;
     const parsed = setup.safeParse(req.body);
     if (!parsed.success)
       throw new Fault('invalid_connection_form', 3, validationIssues(parsed.error, 'form'));
@@ -251,6 +254,7 @@ export async function createWeb(
     migrationId = recordedMigrationId ?? scope.migration ?? migrationId ?? randomUUID();
     plan = undefined;
     error = undefined;
+    snapshot = undefined;
     const { c, v } = withPolicies(scope.folderPolicies);
     const now = new Date().toISOString();
     discovery = {
@@ -265,14 +269,27 @@ export async function createWeb(
       folderScanned: 0,
     };
     discoveryController = new AbortController();
-    void makePlan(c, v, factory, { pilot: scope.pilot, mailbox: scope.mailbox }, migrationId, {
-      signal: discoveryController.signal,
-      progress: (value) => {
-        discovery = { ...discovery!, ...value, updatedAt: new Date().toISOString() };
+    void discoverSnapshot(
+      c,
+      v,
+      factory,
+      { pilot: scope.pilot, mailbox: scope.mailbox },
+      migrationId,
+      {
+        signal: discoveryController.signal,
+        progress: (value) => {
+          discovery = { ...discovery!, ...value, updatedAt: new Date().toISOString() };
+        },
       },
-    })
+    )
       .then((result) => {
-        plan = result;
+        plan = planFromSnapshot(
+          c,
+          result,
+          { pilot: scope.pilot, mailbox: scope.mailbox },
+          migrationId,
+        );
+        snapshot = result;
         discovery = {
           ...discovery!,
           status: 'complete',
@@ -293,6 +310,38 @@ export async function createWeb(
         discoveryController = undefined;
       });
     return reply.code(202).send({ discovery, migrationId, recordedMigrationId });
+  });
+  app.post('/api/replan', async (req) => {
+    idle();
+    ready();
+    plan = undefined;
+    const input = z
+      .object({
+        snapshotId: z.string().uuid(),
+        pilot: z.number().int().positive().optional(),
+        migration: z.string().uuid().optional(),
+        folderPolicies: z.array(z.object({ id: z.string(), folders: folderPolicy }).strict()),
+      })
+      .strict()
+      .parse(req.body);
+    if (!snapshot || snapshot.id !== input.snapshotId)
+      throw new Fault('refresh_discovery_required');
+    if (input.migration && input.migration !== migrationId)
+      throw new Fault('migration_id_does_not_match_snapshot');
+    const { c } = withPolicies(input.folderPolicies);
+    plan = planFromSnapshot(
+      c,
+      snapshot,
+      { ...snapshot.inventory.scope, pilot: input.pilot },
+      migrationId,
+    );
+    error = undefined;
+    return {
+      plan,
+      migrationId,
+      recordedMigrationId,
+      snapshot: { id: snapshot.id, created: snapshot.created },
+    };
   });
   app.post('/api/run', async (req) => {
     idle();
@@ -353,6 +402,7 @@ export async function createWeb(
   });
   app.post('/api/load', async (req) => {
     idle();
+    snapshot = undefined;
     const { migration, folderPolicies } = z
       .object({
         migration: z.string().uuid(),

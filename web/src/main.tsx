@@ -31,6 +31,7 @@ type Plan = {
   id: string;
   hash: string;
   migration: string;
+  discoveredAt?: string;
   blockers: string[];
   scope: { pilot?: number };
   pairs: {
@@ -72,6 +73,7 @@ type Session = {
   running: boolean;
   migrationId?: string;
   recordedMigrationId?: string;
+  snapshot?: { id: string; created: string };
   plan?: Plan;
   report?: Report;
   error?: string;
@@ -104,7 +106,9 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
       ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: ['session', 'plan', 'cancel'].includes(path) ? AbortSignal.timeout(15000) : undefined,
+    signal: ['session', 'plan', 'replan', 'cancel'].includes(path)
+      ? AbortSignal.timeout(15000)
+      : undefined,
   });
   const data = await r.json();
   if (!r.ok && data.error === 'session_rejected') throw rejectSession(token);
@@ -153,8 +157,13 @@ function App() {
     [sessionRevision, setSessionRevision] = useState(0),
     [startingPlan, setStartingPlan] = useState(false),
     [planDirty, setPlanDirty] = useState(true),
+    [reviewRevision, setReviewRevision] = useState(0),
+    [rebuilding, setRebuilding] = useState(false),
     [discoveryError, setDiscoveryError] = useState('');
   const pendingDiscovery = useRef<string | undefined>(undefined);
+  const reviewEpoch = useRef(0);
+  const localRebuildPending = useRef(false);
+  const rebuildQueue = useRef<Promise<void>>(Promise.resolve());
   const plan = session.plan,
     report = session.report;
   const discovering = startingPlan || session.discovery?.status === 'running';
@@ -190,9 +199,16 @@ function App() {
     let live = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = () => {
+      const epoch = reviewEpoch.current;
+      const rebuildingAtStart = localRebuildPending.current;
       api<Session>('session')
         .then((s) => {
-          if (live) {
+          if (
+            live &&
+            !rebuildingAtStart &&
+            !localRebuildPending.current &&
+            epoch === reviewEpoch.current
+          ) {
             setSession(s);
             if (
               s.plan &&
@@ -245,13 +261,25 @@ function App() {
     invalidatePlan();
   }
   function invalidatePlan() {
+    reviewEpoch.current++;
+    localRebuildPending.current = false;
+    setRebuilding(false);
     pendingDiscovery.current = undefined;
     setPlanDirty(true);
     setConfirm(false);
   }
   function editPolicy(index: number, change: Pick<Pair, 'folders'>) {
     setPairs((old) => old.map((p, i) => (i === index ? { ...p, ...change } : p)));
+    scheduleRebuild();
+  }
+  function scheduleRebuild() {
     invalidatePlan();
+    setDiscoveryError('');
+    if (ready && session.snapshot) {
+      localRebuildPending.current = true;
+      setRebuilding(true);
+      setReviewRevision((value) => value + 1);
+    }
   }
   function folderPolicies() {
     return pairs.map((p, index) => {
@@ -266,6 +294,51 @@ function App() {
       return { id: p.id, folders: { ...p.folders, overrides } };
     });
   }
+  useEffect(() => {
+    if (!ready || !session.snapshot || !localRebuildPending.current) return;
+    let live = true;
+    const epoch = reviewEpoch.current;
+    const snapshotId = session.snapshot.id;
+    const timer = setTimeout(() => {
+      // Serialize requests and discard superseded responses when selections change rapidly.
+      rebuildQueue.current = rebuildQueue.current
+        .catch(() => {})
+        .then(async () => {
+          if (!live || epoch !== reviewEpoch.current) return;
+          try {
+            const result = await api<
+              Pick<Session, 'plan' | 'snapshot' | 'migrationId' | 'recordedMigrationId'>
+            >('replan', {
+              snapshotId,
+              folderPolicies: folderPolicies(),
+              ...(pilot ? { pilot: Number(pilot) } : {}),
+              ...(migration ? { migration } : {}),
+            });
+            if (!live || epoch !== reviewEpoch.current) return;
+            reviewEpoch.current++;
+            setSession((s) => ({ ...s, ...result, error: undefined }));
+            setPlanDirty(false);
+            setDiscoveryError('');
+          } catch (e) {
+            if (!live || epoch !== reviewEpoch.current) return;
+            if (e instanceof SessionExpired) handleFailure(e);
+            else
+              setDiscoveryError(
+                `Could not update the plan: ${(e as Error).message}. Correct the policy or refresh discovery.`,
+              );
+          } finally {
+            if (live) {
+              localRebuildPending.current = false;
+              setRebuilding(false);
+            }
+          }
+        });
+    }, 200);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [reviewRevision, ready, session.snapshot?.id]);
   async function download(path: string, name: string) {
     const value = await api(path);
     const url = URL.createObjectURL(
@@ -543,7 +616,7 @@ function App() {
               disabled={disabled}
               onChange={(e) => {
                 setPilot(e.target.value);
-                invalidatePlan();
+                scheduleRebuild();
               }}
             />
           </label>
@@ -554,7 +627,7 @@ function App() {
               disabled={disabled}
               onChange={(e) => {
                 setMigration(e.target.value);
-                invalidatePlan();
+                scheduleRebuild();
               }}
             />
           </label>
@@ -563,8 +636,8 @@ function App() {
           <legend>Folder policy</legend>
           <p>
             Discover folders first, then use the Include checkboxes below. Unchecking a folder adds
-            its exact name to exclusions. After changes, rebuild the plan and review it before
-            confirming.
+            its exact name to exclusions. Changes automatically update the plan from the discovery
+            snapshot without contacting mail servers. Review the updated plan before confirming.
           </p>
           {pairs.map((p, index) => (
             <div key={index}>
@@ -593,7 +666,7 @@ function App() {
                     value={overrideDrafts[index] ?? JSON.stringify(p.folders.overrides)}
                     onChange={(e) => {
                       setOverrideDrafts((d) => ({ ...d, [index]: e.target.value }));
-                      invalidatePlan();
+                      scheduleRebuild();
                       setConfirm(false);
                     }}
                     onBlur={(e) => {
@@ -636,20 +709,26 @@ function App() {
         </fieldset>
         {planDirty && plan && (
           <p role="status" className="warning">
-            Folder policy or scope has changed. Click Discover folders &amp; build plan to update
-            counts and exclusions before approval. No connection retest is needed.
+            {rebuilding
+              ? 'Updating plan from discovery snapshot…'
+              : 'The plan needs updating before approval. Correct any policy errors, or refresh discovery if no snapshot is available.'}
           </p>
         )}
         <div className="row">
           <button
-            disabled={!ready || disabled}
+            disabled={!ready || disabled || rebuilding}
             onClick={() =>
               void perform(async () => {
                 invalidatePlan();
                 setStartingPlan(true);
                 setConfirm(false);
                 setDiscoveryError('');
-                setSession((s) => ({ ...s, plan: undefined, discovery: undefined }));
+                setSession((s) => ({
+                  ...s,
+                  plan: undefined,
+                  discovery: undefined,
+                  snapshot: undefined,
+                }));
                 try {
                   const result = await api<{
                     discovery: Discovery;
@@ -683,11 +762,21 @@ function App() {
               })
             }
           >
-            {discovering ? 'Discovering folders…' : 'Discover folders & build plan'}
+            {discovering
+              ? 'Discovering folders…'
+              : session.snapshot
+                ? 'Refresh discovery'
+                : 'Discover folders & build plan'}
           </button>
           <button
             className="secondary"
-            disabled={!ready || !migration || migration !== session.recordedMigrationId || disabled}
+            disabled={
+              !ready ||
+              !migration ||
+              migration !== session.recordedMigrationId ||
+              disabled ||
+              rebuilding
+            }
             onClick={() =>
               void perform(async () => {
                 invalidatePlan();
@@ -695,7 +784,7 @@ function App() {
                   migration,
                   folderPolicies: folderPolicies(),
                 });
-                setSession((s) => ({ ...s, ...loaded }));
+                setSession((s) => ({ ...s, ...loaded, snapshot: undefined }));
                 setMigration(loaded.plan.migration);
                 setSession((s) => ({
                   ...s,
@@ -736,6 +825,13 @@ function App() {
             }
           />
         )}
+        {session.snapshot && (
+          <p role="status">
+            Discovery snapshot: {new Date(session.snapshot.created).toLocaleString()}. Selection
+            changes use this snapshot. Use Refresh discovery to include new mail or scan a
+            previously excluded folder.
+          </p>
+        )}
         {plan && (
           <>
             <p className="mono">
@@ -751,7 +847,9 @@ function App() {
             )}
             {plan.blockers.map((b) => (
               <p className="error" key={b}>
-                {b}
+                {b.includes(':refresh_discovery_required:')
+                  ? `${b.split(':refresh_discovery_required:')[0]}: ${b.split(':refresh_discovery_required:')[1]} was not inventoried. Refresh discovery to include this folder, or uncheck it.`
+                  : b}
               </p>
             ))}
             {plan.pairs.map((p) => (

@@ -16,7 +16,7 @@ A migration is anchored to explicit endpoint identities (hostname, port, TLS mod
 
 Plans contain a version, run/migration UUID, plan UUID, configuration fingerprint and SHA-256 over deterministic JSON. Secret references and credentials are excluded from the fingerprint; rotation does not change identity. The approval hash binds confirmation to the plan, but is not a digital signature: someone who controls local files already controls this application. Protect plans and state.
 
-Each plan captures UIDNEXT minus one for every selected source folder, enumerates actual UIDs below it, and stores metadata. Disappearing selected messages become gaps. Later arrivals and new folders need a new catch-up plan. Per-folder scans are not an atomic account-wide snapshot. A pilot persists only its selected occurrences and its explicit limit; observed source counts and bytes cover the larger scanned scope.
+Each plan captures UIDNEXT minus one for every selected source folder, enumerates actual UIDs below it, and stores metadata. Disappearing selected messages become gaps. Later arrivals and new folders need a new catch-up plan. Per-folder scans are not an atomic account-wide snapshot. A pilot persists only its selected occurrences and its explicit limit; observed source counts cover the larger scanned scope, while plan byte totals cover selected occurrences.
 
 Browser discovery is asynchronous: `POST /api/plan` responds with HTTP 202 and job progress; authenticated `GET /api/session` polls its state. A completed plan is published only after the full read-only scan. The server rejects concurrent setup/write jobs while discovery is running. Cancellation (including process shutdown) aborts active reads and closes both adapters. Per-read progress deadlines prevent a stuck connection/list/search/fetch from waiting forever. The timeout defaults to the configured socket timeout; completed metadata batches extend it so healthy long scans can finish. No partial plan survives failure or cancellation.
 
@@ -49,6 +49,12 @@ The disposable-server test transfers a 25 MiB message and records whole-process 
 A separate synthetic-adapter smoke test did run at 25 MiB/concurrency one and measured about 219.7 MiB peak RSS. That is application-only evidence; see `TESTING.md` for exact measurements and remaining gaps.
 
 Read-side network errors have at most three attempts with exponential delay and jitter. Connections have configured connect/greeting/socket timeouts. There is no authentication retry loop or automatic reconnect. A failed mailbox pauses while independent mailbox pairs can finish. APPEND errors never use read retry logic. Cancellation stops new scheduling, settles the current bounded operation, leaves durable evidence or ambiguity, and returns incomplete/interrupted status. SIGKILL/power loss can leave a stale lock but never triggers a database reset.
+
+## Local plan rebuilding
+
+`discoverSnapshot` retains the full bounded inventory in backend memory, including metadata beyond a pilot selection and the destination folder listing. `planFromSnapshot` recomputes mappings, selected occurrences, bytes, size blockers, label acknowledgement, fingerprint and approval hash without any transport calls. It creates a fresh plan ID while preserving the migration ID and records the discovery timestamp separately from plan creation time. Original inventory arrays are retained when folders are deselected, allowing local re-inclusion. A folder with no scanned UID boundary produces a blocking refresh requirement instead of an empty successful selection.
+
+`POST /api/replan` accepts only folder policies, pilot scope, the matching migration ID and the current snapshot ID. It clears the old executable plan before rebuilding. Changes to connection settings or inventory limits require discovery again. Connection retest, discovery refresh, loading a saved plan and process restart discard the snapshot; cancelled/failed discovery never publishes a partial snapshot. The browser debounces and serializes local rebuild requests, discards superseded responses and prevents older polling responses from restoring stale approval. Execution retains its source identity and destination verification checks.
 
 ## Security and trust boundaries
 

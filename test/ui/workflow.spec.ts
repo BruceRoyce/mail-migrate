@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 
-test('discovered folder selections sync exclusions and require a rebuilt plan without retesting', async ({
+test('folder edits automatically rebuild from the snapshot without discovery or connection tests', async ({
   page,
 }) => {
   const { token } = JSON.parse(readFileSync('test/ui-session.json', 'utf8'));
@@ -14,9 +14,13 @@ test('discovered folder selections sync exclusions and require a rebuilt plan wi
     .filter({ has: page.getByRole('heading', { name: '2. Review the migration plan' }) });
   await expect(connect.getByText('Folder policy', { exact: false })).toHaveCount(0);
   await expect(review.getByText('Folder policy · mailbox-1', { exact: true })).toBeVisible();
-  let tests = 0;
+  let tests = 0,
+    discoveries = 0,
+    replans = 0;
   page.on('request', (r) => {
     if (r.url().endsWith('/api/test')) tests++;
+    if (r.url().endsWith('/api/plan')) discoveries++;
+    if (r.url().endsWith('/api/replan')) replans++;
   });
   for (const side of ['source', 'destination']) {
     await page
@@ -55,13 +59,20 @@ test('discovered folder selections sync exclusions and require a rebuilt plan wi
   const start = page.getByRole('button', { name: 'Start migration', exact: true });
   await consent.check();
   await expect(start).toBeEnabled();
+  await page.route(
+    '**/api/replan',
+    async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await route.continue();
+    },
+    { times: 1 },
+  );
   await clients.uncheck();
   const exclusions = page.getByLabel('mailbox-1 excluded folders', { exact: true });
   await expect(exclusions).toHaveValue('Clients/日本語');
   await expect(consent).not.toBeChecked();
   await expect(consent).toBeDisabled();
   await expect(start).toBeDisabled();
-  await expect(discover).toBeEnabled();
   // Polling must not restore approval of the old plan after a local edit.
   await page.waitForResponse((r) => r.url().endsWith('/api/session'));
   await expect(consent).toBeDisabled();
@@ -70,7 +81,7 @@ test('discovered folder selections sync exclusions and require a rebuilt plan wi
   await expect(inbox).not.toBeChecked();
   await inbox.check();
   await expect(exclusions).toHaveValue('Clients/日本語');
-  await discover.click();
+
   await expect(page.getByRole('cell', { name: 'explicit_exclusion', exact: true })).toBeVisible();
   await expect(clients).not.toBeChecked();
   await expect(consent).toBeEnabled();
@@ -80,12 +91,22 @@ test('discovered folder selections sync exclusions and require a rebuilt plan wi
   await clients.check();
   await expect(exclusions).toHaveValue('');
   await expect(consent).toBeDisabled();
-  await discover.click();
+
   await expect(consent).toBeEnabled();
   await expect(clients).toBeChecked();
   await expect(migrationField).toHaveValue(migrationId);
   await expect(page.getByRole('cell', { name: 'explicit_exclusion', exact: true })).toHaveCount(0);
   expect(tests).toBe(1);
+  expect(discoveries).toBe(1);
+  expect(replans).toBeGreaterThanOrEqual(2);
+  const pilotField = page.getByLabel('Pilot message limit (blank = all)', { exact: true });
+  await pilotField.fill('1');
+  await expect(consent).toBeEnabled();
+  await expect(page.getByText('Pilot scope: at most 1 messages.', { exact: false })).toBeVisible();
+  await pilotField.fill('');
+  await expect(consent).toBeEnabled();
+  await expect(page.getByText('Pilot scope: at most', { exact: false })).toHaveCount(0);
+  expect(discoveries).toBe(1);
 });
 
 test('folder selections preserve existing exclusions and remain scoped to each mailbox pair', async ({
@@ -124,8 +145,17 @@ test('folder selections preserve existing exclusions and remain scoped to each m
   await expect(
     page.getByRole('checkbox', { name: 'Include mailbox-1 INBOX', exact: true }),
   ).toBeChecked();
-  await discover.click();
+
   await expect(page.getByRole('cell', { name: 'explicit_exclusion', exact: true })).toHaveCount(2);
+  const previouslyExcluded = page.getByRole('checkbox', {
+    name: 'Include mailbox-1 Clients/日本語',
+    exact: true,
+  });
+  await previouslyExcluded.check();
+  await expect(page.getByText('was not inventoried.', { exact: false })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Start migration', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Refresh discovery', exact: true }).click();
+  await expect(page.getByText('was not inventoried.', { exact: false })).toHaveCount(0);
   await expect(
     page.getByLabel('I reviewed this plan’s accounts, folders and scope.', { exact: false }),
   ).toBeEnabled();
@@ -169,7 +199,7 @@ test('operator connects, reviews, confirms, migrates and downloads evidence', as
   await page
     .getByRole('checkbox', { name: 'Include mailbox-1 Clients/日本語', exact: true })
     .uncheck();
-  await page.getByRole('button', { name: 'Discover folders & build plan', exact: true }).click();
+
   await expect(
     page.getByLabel('I reviewed this plan’s accounts, folders and scope.', { exact: false }),
   ).toBeEnabled();

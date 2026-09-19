@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type Config, type Endpoint, fingerprint, identity } from './config.js';
 import { hash, canonical, Fault } from './safety.js';
-import type { Folder, Mapping, Plan, Reader } from './model.js';
+import type { DiscoverySnapshot, Folder, Mapping, Plan } from './model.js';
 import type { Factory } from './transport.js';
 import { DiscoveryControl, type DiscoveryOptions, type DiscoveryProgress } from './discovery.js';
 export function mappings(
@@ -80,14 +80,14 @@ export function checkPlan(p: Plan, c: Config): void {
     ids.add(pair.id);
   }
 }
-export async function makePlan(
+export async function discoverSnapshot(
   c: Config,
   values: Map<Endpoint, string>,
   factory: Factory,
   scope: Plan['scope'] = {},
   migration: string = randomUUID(),
   options: DiscoveryOptions = {},
-): Promise<Plan> {
+): Promise<DiscoverySnapshot> {
   if (scope.mailbox && !c.mailboxes.some((m) => m.id === scope.mailbox))
     throw new Fault('unknown_mailbox', 3);
   const p: Plan = {
@@ -108,8 +108,8 @@ export async function makePlan(
       'Flags are checked at transfer and verification; unsupported metadata is reported.',
     ],
   };
-  let remaining = c.defaults.maxOccurrences,
-    pilot = scope.pilot ?? Infinity;
+  let remaining = c.defaults.maxOccurrences;
+  const destinations: Record<string, Folder[]> = {};
   const control = new DiscoveryControl(
     options.operationTimeoutMs ?? c.defaults.timeoutSeconds * 1000,
     options.signal,
@@ -150,6 +150,7 @@ export async function makePlan(
         const sf = await control.read(() => s.list());
         emit({ phase: 'listing_destination' });
         const df = await control.read(() => d.list());
+        destinations[m.id] = df;
         const map = mappings(sf, df, m.folders, c.defaults.includeSpamAndTrash);
         emit({ foldersTotal: progress.foldersTotal + map.filter((f) => !f.excluded).length });
         if (
@@ -197,8 +198,7 @@ export async function makePlan(
           if (after.validity !== v.validity) throw new Fault('source_uidvalidity_changed');
           remaining -= messages.length;
           f.bytes = messages.reduce((n, m) => n + m.size, 0);
-          f.messages = messages.slice(0, pilot);
-          pilot -= f.messages.length;
+          f.messages = messages;
           f.oversized = f.messages.filter(
             (msg) => msg.size > Math.min(c.defaults.maxMessageBytes, d.appendLimit() ?? Infinity),
           ).length;
@@ -232,8 +232,106 @@ export async function makePlan(
       }
     }
     emit({ phase: 'complete' });
-    return seal(p);
+    return {
+      id: randomUUID(),
+      created: new Date().toISOString(),
+      configuration: snapshotConfiguration(c),
+      inventory: p,
+      destinations,
+    };
   } finally {
     control.dispose();
   }
+}
+
+function snapshotConfiguration(c: Config): string {
+  return fingerprint({
+    ...c,
+    mailboxes: c.mailboxes.map((m) => ({
+      ...m,
+      folders: { exclude: [], overrides: {}, labelStrategy: 'unresolved' },
+    })),
+  });
+}
+
+export function planFromSnapshot(
+  c: Config,
+  snapshot: DiscoverySnapshot,
+  scope: Plan['scope'] = {},
+  migration = snapshot.inventory.migration,
+): Plan {
+  if (snapshot.configuration !== snapshotConfiguration(c))
+    throw new Fault('discovery_settings_changed');
+  if (scope.mailbox && !snapshot.inventory.pairs.some((p) => p.id === scope.mailbox))
+    throw new Fault('discovery_scope_missing');
+  const plan: Plan = {
+    ...snapshot.inventory,
+    id: randomUUID(),
+    created: new Date().toISOString(),
+    discoveredAt: snapshot.created,
+    migration,
+    fingerprint: fingerprint(c),
+    hash: '',
+    scope: { ...scope },
+    pairs: [],
+    blockers: [],
+  };
+  let remaining = scope.pilot ?? Infinity;
+  for (const original of snapshot.inventory.pairs.filter(
+    (p) => !scope.mailbox || p.id === scope.mailbox,
+  )) {
+    const configured = c.mailboxes.find((m) => m.id === original.id)!;
+    const mapped = mappings(
+      original.mappings.map((m) => ({ ...m.source })),
+      snapshot.destinations[original.id]!,
+      configured.folders,
+      c.defaults.includeSpamAndTrash,
+    );
+    if (
+      (original.capabilities.source.includes('X-GM-EXT-1') ||
+        original.mappings.some((m) => ['\\All', '\\Flagged'].includes(m.source.special ?? ''))) &&
+      configured.folders.labelStrategy !== 'explicit-folders'
+    )
+      plan.blockers.push(original.id + ':explicit_label_strategy_required');
+    for (const folder of mapped) {
+      if (folder.excluded) continue;
+      const scanned = original.mappings.find((m) => m.source.path === folder.source.path)!;
+      if (scanned.boundary === undefined) {
+        plan.blockers.push(`${original.id}:refresh_discovery_required:${folder.source.path}`);
+        continue;
+      }
+      folder.boundary = scanned.boundary;
+      folder.messages = scanned.messages.slice(0, remaining);
+      remaining -= folder.messages.length;
+      folder.bytes = folder.messages.reduce((sum, message) => sum + message.size, 0);
+      folder.oversized = folder.messages.filter(
+        (m) => m.size > Math.min(c.defaults.maxMessageBytes, original.appendLimit ?? Infinity),
+      ).length;
+    }
+    plan.pairs.push({
+      ...original,
+      mappings: mapped,
+      warnings: [
+        ...original.warnings.filter((w) => w !== 'pilot_excludes_remaining_occurrences'),
+        ...(scope.pilot ? ['pilot_excludes_remaining_occurrences'] : []),
+      ],
+    });
+  }
+  return seal(plan);
+}
+
+export async function makePlan(
+  c: Config,
+  values: Map<Endpoint, string>,
+  factory: Factory,
+  scope: Plan['scope'] = {},
+  migration: string = randomUUID(),
+  options: DiscoveryOptions = {},
+): Promise<Plan> {
+  return planFromSnapshot(
+    c,
+    await discoverSnapshot(c, values, factory, scope, migration, options),
+    scope,
+    migration,
+  );
 }

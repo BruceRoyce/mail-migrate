@@ -27,6 +27,58 @@ const payload = () => ({
   maxMessageMiB: 25,
   memoryBudgetMiB: 512,
 });
+test('local replan uses the retained snapshot without any IMAP operations and invalidates old approvals', async () => {
+  const f = fixture();
+  f.source.folders.get('INBOX')!.add();
+  let adapters = 0;
+  const web = await createWeb(8787, f.c.stateDirectory, f.c.reportDirectory, (...args) => {
+    adapters++;
+    return f.factory(...args);
+  });
+  const headers = { host: '127.0.0.1:8787', 'x-session-token': web.token };
+  const post = (path: string, payload: object) =>
+    web.app.inject({ url: '/api/' + path, method: 'POST', headers, payload });
+  const state = async () => (await web.app.inject({ url: '/api/session', headers })).json();
+  try {
+    await post('test', payload());
+    await post('plan', { pilot: 1 });
+    for (let i = 0; i < 100 && web.isRunning(); i++) await new Promise((r) => setTimeout(r, 5));
+    const original = await state();
+    const requests = adapters;
+    const policies = [
+      { id: 'test', folders: { exclude: ['INBOX'], overrides: {}, labelStrategy: 'unresolved' } },
+    ];
+    const changed = await post('replan', {
+      snapshotId: original.snapshot.id,
+      folderPolicies: policies,
+    });
+    assert.equal(changed.statusCode, 200);
+    assert.equal(changed.json().plan.migration, original.plan.migration);
+    assert.notEqual(changed.json().plan.hash, original.plan.hash);
+    assert.equal(changed.json().plan.pairs[0].mappings[0].excluded, 'explicit_exclusion');
+    assert.equal(
+      (await post('run', { hash: original.plan.hash, confirm: true })).json().error,
+      'confirmation_hash_mismatch',
+    );
+    policies[0]!.folders.exclude = [];
+    const restored = await post('replan', {
+      snapshotId: original.snapshot.id,
+      folderPolicies: policies,
+    });
+    assert.equal(restored.json().plan.pairs[0].mappings[0].messages.length, 1);
+    assert.equal(adapters, requests);
+    assert.equal(f.destination.writes.length, 0);
+    await post('test', payload());
+    const stale = await post('replan', {
+      snapshotId: original.snapshot.id,
+      folderPolicies: policies,
+    });
+    assert.equal(stale.json().error, 'refresh_discovery_required');
+    assert.equal((await state()).plan, undefined);
+  } finally {
+    await web.app.close();
+  }
+});
 test('review policies rebuild the approved scope without retesting or changing credentials', async () => {
   const f = fixture();
   f.source.folders.get('INBOX')!.add();
