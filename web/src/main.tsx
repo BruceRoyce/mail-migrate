@@ -1099,6 +1099,8 @@ function App() {
         <br />
         Reports contain sensitive mailbox metadata. Completion is limited to the recorded scope and
         observation window.
+        <br />
+        2026 | Bruce Royce - <a href="mailto:bruce@bruceroyce.com">bruce@bruceroyce.com</a>
       </footer>
     </main>
   );
