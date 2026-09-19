@@ -17,7 +17,7 @@ FROM node:24 AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=production-dependencies /app/node_modules ./node_modules
-COPY package.json ./
+COPY package.json LICENSE ./
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/web-dist ./web-dist
 RUN mkdir -p /data/state /data/reports && chown -R node:node /data && chmod 700 /data /data/state /data/reports

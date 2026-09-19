@@ -200,3 +200,7 @@ See [architecture and recovery policy](docs/ARCHITECTURE.md), [operator runbook]
 Before a live migration, the owner still needs to confirm provider endpoints/authentication, mailbox mappings versus aliases, provisioning, volumes/largest messages/quotas, active-user behaviour, folder scope and DNS/cutover ownership. **Building this application does not authorise operating on real mailboxes.**
 
 # mail-migrate
+
+## License
+
+Licensed under the [MIT License](LICENSE).

@@ -2,6 +2,7 @@
 # Excludes credentials, migration state, reports, Git, and host node_modules.
 **
 !Dockerfile
+!LICENSE
 !.dockerignore
 !package.json
 !package-lock.json
