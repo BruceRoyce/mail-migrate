@@ -1,5 +1,135 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
+
+test('discovered folder selections sync exclusions and require a rebuilt plan without retesting', async ({
+  page,
+}) => {
+  const { token } = JSON.parse(readFileSync('test/ui-session.json', 'utf8'));
+  await page.goto('/#' + token);
+  const connect = page
+    .locator('section')
+    .filter({ has: page.getByRole('heading', { name: '1. Test your connections' }) });
+  const review = page
+    .locator('section')
+    .filter({ has: page.getByRole('heading', { name: '2. Review the migration plan' }) });
+  await expect(connect.getByText('Folder policy', { exact: false })).toHaveCount(0);
+  await expect(review.getByText('Folder policy · mailbox-1', { exact: true })).toBeVisible();
+  let tests = 0;
+  page.on('request', (r) => {
+    if (r.url().endsWith('/api/test')) tests++;
+  });
+  for (const side of ['source', 'destination']) {
+    await page
+      .getByLabel(`mailbox-1 ${side} host`, { exact: true })
+      .fill(side === 'source' ? 'old.example' : 'new.example');
+    await page
+      .getByLabel(`mailbox-1 ${side} username`, { exact: true })
+      .fill('synthetic@business.example');
+    await page.getByLabel(`mailbox-1 ${side} password`, { exact: true }).fill('synthetic-only');
+  }
+  await page.getByRole('button', { name: 'Test both connections' }).click();
+  const discover = page.getByRole('button', { name: 'Discover folders & build plan', exact: true });
+  await discover.click();
+  const inbox = page.getByRole('checkbox', { name: 'Include mailbox-1 INBOX', exact: true });
+  const clients = page.getByRole('checkbox', {
+    name: 'Include mailbox-1 Clients/日本語',
+    exact: true,
+  });
+  const nonselectable = page.getByRole('checkbox', {
+    name: 'Include mailbox-1 Container only',
+    exact: true,
+  });
+  await expect(inbox).toBeChecked();
+  await expect(clients).toBeChecked();
+  const migrationField = page.getByLabel('Existing migration ID (resume / catch-up)', {
+    exact: true,
+  });
+  const migrationId = await migrationField.inputValue();
+  expect(migrationId).toMatch(/^[0-9a-f-]{36}$/);
+  await expect(page.getByRole('button', { name: 'Load saved migration' })).toBeDisabled();
+  await expect(nonselectable).not.toBeChecked();
+  await expect(nonselectable).toBeDisabled();
+  const consent = page.getByLabel('I reviewed this plan’s accounts, folders and scope.', {
+    exact: false,
+  });
+  const start = page.getByRole('button', { name: 'Start migration', exact: true });
+  await consent.check();
+  await expect(start).toBeEnabled();
+  await clients.uncheck();
+  const exclusions = page.getByLabel('mailbox-1 excluded folders', { exact: true });
+  await expect(exclusions).toHaveValue('Clients/日本語');
+  await expect(consent).not.toBeChecked();
+  await expect(consent).toBeDisabled();
+  await expect(start).toBeDisabled();
+  await expect(discover).toBeEnabled();
+  // Polling must not restore approval of the old plan after a local edit.
+  await page.waitForResponse((r) => r.url().endsWith('/api/session'));
+  await expect(consent).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Download private plan' })).toBeDisabled();
+  await exclusions.fill('INBOX\nClients/日本語\n');
+  await expect(inbox).not.toBeChecked();
+  await inbox.check();
+  await expect(exclusions).toHaveValue('Clients/日本語');
+  await discover.click();
+  await expect(page.getByRole('cell', { name: 'explicit_exclusion', exact: true })).toBeVisible();
+  await expect(clients).not.toBeChecked();
+  await expect(consent).toBeEnabled();
+  await expect(migrationField).toHaveValue(migrationId);
+  await expect(start).toBeDisabled();
+  await page.screenshot({ path: 'test-results/folder-selection.png', fullPage: true });
+  await clients.check();
+  await expect(exclusions).toHaveValue('');
+  await expect(consent).toBeDisabled();
+  await discover.click();
+  await expect(consent).toBeEnabled();
+  await expect(clients).toBeChecked();
+  await expect(migrationField).toHaveValue(migrationId);
+  await expect(page.getByRole('cell', { name: 'explicit_exclusion', exact: true })).toHaveCount(0);
+  expect(tests).toBe(1);
+});
+
+test('folder selections preserve existing exclusions and remain scoped to each mailbox pair', async ({
+  page,
+}) => {
+  const { token } = JSON.parse(readFileSync('test/ui-session.json', 'utf8'));
+  await page.goto('/#' + token);
+  await page.getByRole('button', { name: 'Add mailbox pair' }).click();
+  for (const id of ['mailbox-1', 'mailbox-2']) {
+    for (const side of ['source', 'destination']) {
+      await page
+        .getByLabel(`${id} ${side} host`, { exact: true })
+        .fill(side === 'source' ? 'old.example' : 'new.example');
+      await page
+        .getByLabel(`${id} ${side} username`, { exact: true })
+        .fill(`${id}@business.example`);
+      await page.getByLabel(`${id} ${side} password`, { exact: true }).fill('synthetic-only');
+    }
+  }
+  await page.getByRole('button', { name: 'Test both connections' }).click();
+  const first = page.getByLabel('mailbox-1 excluded folders', { exact: true });
+  const second = page.getByLabel('mailbox-2 excluded folders', { exact: true });
+  await expect(first).toBeEnabled();
+  await first.fill('Clients/日本語');
+  const discover = page.getByRole('button', { name: 'Discover folders & build plan', exact: true });
+  await discover.click();
+  await expect(
+    page.getByRole('checkbox', { name: 'Include mailbox-1 Clients/日本語', exact: true }),
+  ).not.toBeChecked();
+  await expect(
+    page.getByRole('checkbox', { name: 'Include mailbox-2 Clients/日本語', exact: true }),
+  ).toBeChecked();
+  await page.getByRole('checkbox', { name: 'Include mailbox-2 INBOX', exact: true }).uncheck();
+  await expect(first).toHaveValue('Clients/日本語');
+  await expect(second).toHaveValue('INBOX');
+  await expect(
+    page.getByRole('checkbox', { name: 'Include mailbox-1 INBOX', exact: true }),
+  ).toBeChecked();
+  await discover.click();
+  await expect(page.getByRole('cell', { name: 'explicit_exclusion', exact: true })).toHaveCount(2);
+  await expect(
+    page.getByLabel('I reviewed this plan’s accounts, folders and scope.', { exact: false }),
+  ).toBeEnabled();
+});
 test('operator connects, reviews, confirms, migrates and downloads evidence', async ({ page }) => {
   const { token } = JSON.parse(readFileSync('test/ui-session.json', 'utf8'));
   await page.goto('/#' + token);
@@ -32,6 +162,26 @@ test('operator connects, reviews, confirms, migrates and downloads evidence', as
   const download = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Download private report' }).click();
   await expect((await download).suggestedFilename()).toBe('migration-report.json');
+  const migrationField = page.getByLabel('Existing migration ID (resume / catch-up)', {
+    exact: true,
+  });
+  const recordedId = await migrationField.inputValue();
+  await page
+    .getByRole('checkbox', { name: 'Include mailbox-1 Clients/日本語', exact: true })
+    .uncheck();
+  await page.getByRole('button', { name: 'Discover folders & build plan', exact: true }).click();
+  await expect(
+    page.getByLabel('I reviewed this plan’s accounts, folders and scope.', { exact: false }),
+  ).toBeEnabled();
+  await expect(migrationField).toHaveValue(recordedId);
+  await page
+    .getByLabel('I reviewed this plan’s accounts, folders and scope.', { exact: false })
+    .check();
+  await page.getByRole('button', { name: 'Resume / run catch-up', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'content complete for recorded scope' }),
+  ).toBeVisible({ timeout: 15000 });
+  await expect(page.getByRole('alert')).toHaveCount(0);
   await page.screenshot({ path: 'test-results/workflow.png', fullPage: true });
 });
 

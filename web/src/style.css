@@ -114,6 +114,12 @@ textarea {
   width: auto;
   margin-top: 4px;
 }
+td input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: #175e50;
+}
 button {
   font: inherit;
   font-weight: 650;

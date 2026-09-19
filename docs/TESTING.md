@@ -1,4 +1,4 @@
-# Verification evidence — 18 September 2026
+# Verification evidence — 19 September 2026
 
 Environment: Windows, PowerShell, Node 24.11.0, npm 11.19.0, ImapFlow 2.0.5. The workspace was initially empty and was not a Git checkout. No production credentials or real mailboxes were used.
 
@@ -6,8 +6,8 @@ Environment: Windows, PowerShell, Node 24.11.0, npm 11.19.0, ImapFlow 2.0.5. The
 | ----------------------------------------------- | ------------------------------------------------------------------ |
 | `npm run check`                                 | TypeScript backend and React UI passed                             |
 | `npm run build`                                 | Backend and production UI bundle built                             |
-| `npm test`                                      | **46 passed**, 0 failed, 0 skipped                                 |
-| `npm run test:ui` with installed Microsoft Edge | **8 passed**                                                       |
+| `npm test`                                      | **48 passed**, 0 failed, 0 skipped                                 |
+| `npm run test:ui` with installed Microsoft Edge | **10 passed**                                                      |
 | CLI `--help` and example `validate`             | Passed                                                             |
 | `npm run integration` without opt-in            | **1 explicitly skipped**, 0 passed                                 |
 | Docker availability                             | CLI installed; Linux engine named pipe missing, daemon unavailable |
@@ -19,6 +19,10 @@ Two additional scope regressions are covered: narrowing a plan must not copy old
 The Edge test fills the form, tests both connections, discovers folders, checks that copying is disabled without confirmation, starts a synthetic copy, waits for verified results and downloads a report. A screenshot is generated at `test-results/workflow.png` and was visually inspected. The UI has no remote font or analytics dependencies.
 
 Follow-up regressions cover field-specific validation without credential leakage, session refresh/reconnection, asynchronous discovery progress, cancellation of a stalled read, overlap rejection, safe retry and explicit inventory-limit failures. A sparse-UID adapter test enumerates 501 occurrences near UID 4,000,000,000 using one SEARCH and three FETCH batches, preserves a vanished member as a gap, and asserts that no per-message FETCH is used. Timeout and progress-renewal tests use synthetic readers. The Edge discovery tests use a deliberately slow synthetic folder and verify visible progress and cancellation; `test-results/discovery-progress.png` was visually inspected. None of these are real-provider performance measurements.
+
+Folder-selection regressions verify that policy controls are in section 2, checkboxes and exact-name exclusions stay synchronized, prior exclusions and non-selectable folders are preserved, and selections remain independent across mailbox pairs. Editing invalidates confirmation even after session polling; rebuilding restores eligibility without another connection test. The backend test checks changed plan hashes, old-hash rejection, retained credentials, policy validation, exclusion from scanning and copying, saved-plan loading and re-inclusion. `test-results/folder-selection.png` was visually inspected.
+
+Migration ID regressions verify automatic field population, stable IDs across plan rebuilds, ledger ID recovery after backend restart, rejection of an unrelated ID, and resume without recopying verified messages. All ten browser tests passed; the workflow test was then extended and rerun successfully to cover changing selections and resuming after the first copy.
 
 ## Measured synthetic memory test
 

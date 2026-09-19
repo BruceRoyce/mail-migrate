@@ -173,6 +173,11 @@ export class Store {
     if (!row) throw new Fault('unknown_migration', 3);
     return JSON.parse(row.plan) as Plan;
   }
+  migrationId(): string | undefined {
+    const rows = this.db.prepare('SELECT id FROM migrations').all() as { id: string }[];
+    if (rows.length > 1) throw new Fault('one_migration_per_state_directory', 3);
+    return rows[0]?.id;
+  }
   begin(p: Plan, existing = false): string {
     // Persist identity invalidation outside the new-pass transaction; a blocked plan must
     // not leave old verified rows looking current after a source UIDVALIDITY reset.

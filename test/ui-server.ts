@@ -9,6 +9,13 @@ folder.add();
 f.source.folders.set('Clients/日本語', folder);
 const factory: Factory = (endpoint, secret, writable, config) => {
   const reader = f.factory(endpoint, secret, writable, config);
+  if (endpoint.host === 'old.example') {
+    const list = reader.list.bind(reader);
+    reader.list = async () => [
+      ...(await list()),
+      { path: 'Container only', delimiter: '/', selectable: false },
+    ];
+  }
   if (endpoint.host === 'old.example' && endpoint.username === 'slow@business.example') {
     const scan = reader.scan.bind(reader);
     reader.scan = async (boundary, ceiling, from, control) => {

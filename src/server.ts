@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -25,6 +25,13 @@ const inputEndpoint = z
     caFile: z.string().optional(),
   })
   .strict();
+const folderPolicy = z
+  .object({
+    exclude: z.array(z.string()),
+    overrides: z.record(z.string(), z.string()),
+    labelStrategy: z.enum(['unresolved', 'explicit-folders']),
+  })
+  .strict();
 function withoutPassword(input: z.infer<typeof inputEndpoint>, ref: string) {
   const { password, ...endpoint } = input;
   return { ...endpoint, auth: { type: 'password', secretRef: 'env:' + ref } };
@@ -38,13 +45,7 @@ const setup = z
             id: z.string(),
             source: inputEndpoint,
             destination: inputEndpoint,
-            folders: z
-              .object({
-                exclude: z.array(z.string()),
-                overrides: z.record(z.string(), z.string()),
-                labelStrategy: z.enum(['unresolved', 'explicit-folders']),
-              })
-              .strict(),
+            folders: folderPolicy,
           })
           .strict(),
       )
@@ -64,6 +65,20 @@ export async function createWeb(
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
   const token = randomBytes(32).toString('hex');
   const origin = `http://127.0.0.1:${port}`;
+  const readRecordedMigration = () => {
+    if (!existsSync(join(stateDirectory, 'ledger.sqlite'))) return undefined;
+    const release = lock(stateDirectory);
+    let store: Store | undefined;
+    try {
+      store = new Store(stateDirectory);
+      return store.migrationId();
+    } finally {
+      store?.close();
+      release();
+    }
+  };
+  let recordedMigrationId = readRecordedMigration();
+  let migrationId = recordedMigrationId;
   let config: Config | undefined,
     values: Map<Endpoint, string> | undefined,
     plan: Plan | undefined,
@@ -124,6 +139,33 @@ export async function createWeb(
     if (!config || !values) throw new Fault('test_connections_first');
     return { c: config, v: values };
   };
+  const withPolicies = (
+    policiesInput?: { id: string; folders: z.infer<typeof folderPolicy> }[],
+  ) => {
+    let { c, v } = ready();
+    if (policiesInput) {
+      const policies = new Map(policiesInput.map((p) => [p.id, p.folders]));
+      if (
+        policies.size !== policiesInput.length ||
+        policies.size !== c.mailboxes.length ||
+        c.mailboxes.some((m) => !policies.has(m.id))
+      )
+        throw new Fault('folder_policy_mailboxes_mismatch');
+      // Validate policy changes without allowing endpoint/credential changes or retesting connections.
+      const next = validateConfig({
+        ...c,
+        mailboxes: c.mailboxes.map((m) => ({ ...m, folders: policies.get(m.id) })),
+      });
+      const nextValues = new Map<Endpoint, string>();
+      next.mailboxes.forEach((m, i) => {
+        for (const side of ['source', 'destination'] as const)
+          nextValues.set(m[side], v.get(c.mailboxes[i]![side])!);
+      });
+      config = c = next;
+      values = v = nextValues;
+    }
+    return { c, v };
+  };
   app.get('/api/session', async () => ({
     running,
     plan,
@@ -131,6 +173,8 @@ export async function createWeb(
     error,
     progress,
     discovery,
+    migrationId,
+    recordedMigrationId,
   }));
   app.post('/api/test', async (req) => {
     idle();
@@ -183,21 +227,31 @@ export async function createWeb(
       config = c;
       values = v;
     }
-    return { results, ready: !!config };
+    recordedMigrationId = readRecordedMigration();
+    migrationId = recordedMigrationId ?? migrationId;
+    return { results, ready: !!config, migrationId, recordedMigrationId };
   });
   app.post('/api/plan', async (req, reply) => {
     idle();
-    const { c, v } = ready();
+    ready();
     const scope = z
       .object({
         pilot: z.number().int().positive().optional(),
         mailbox: z.string().optional(),
         migration: z.string().uuid().optional(),
+        folderPolicies: z
+          .array(z.object({ id: z.string(), folders: folderPolicy }).strict())
+          .optional(),
       })
       .strict()
       .parse(req.body ?? {});
+    recordedMigrationId = readRecordedMigration();
+    if (recordedMigrationId && scope.migration && scope.migration !== recordedMigrationId)
+      throw new Fault('migration_id_does_not_match_state_directory');
+    migrationId = recordedMigrationId ?? scope.migration ?? migrationId ?? randomUUID();
     plan = undefined;
     error = undefined;
+    const { c, v } = withPolicies(scope.folderPolicies);
     const now = new Date().toISOString();
     discovery = {
       status: 'running',
@@ -211,7 +265,7 @@ export async function createWeb(
       folderScanned: 0,
     };
     discoveryController = new AbortController();
-    void makePlan(c, v, factory, { pilot: scope.pilot, mailbox: scope.mailbox }, scope.migration, {
+    void makePlan(c, v, factory, { pilot: scope.pilot, mailbox: scope.mailbox }, migrationId, {
       signal: discoveryController.signal,
       progress: (value) => {
         discovery = { ...discovery!, ...value, updatedAt: new Date().toISOString() };
@@ -238,7 +292,7 @@ export async function createWeb(
       .finally(() => {
         discoveryController = undefined;
       });
-    return reply.code(202).send({ discovery });
+    return reply.code(202).send({ discovery, migrationId, recordedMigrationId });
   });
   app.post('/api/run', async (req) => {
     idle();
@@ -254,20 +308,25 @@ export async function createWeb(
     if (!plan || input.hash !== plan.hash) throw new Fault('confirmation_hash_mismatch');
     checkPlan(plan, c);
     const release = lock(c.stateDirectory);
-    let store: Store;
+    let store: Store | undefined;
     try {
       store = new Store(c.stateDirectory, input.mode === 'run');
+      recordedMigrationId = store.migrationId();
+      if (recordedMigrationId && plan.migration !== recordedMigrationId)
+        throw new Fault('migration_id_does_not_match_state_directory');
     } catch (e) {
+      store?.close();
       release();
       throw e;
     }
+    const runStore = store;
     const p = plan;
     running = true;
     cancelled = false;
     error = undefined;
     progress = [];
-    void execute(c, v, factory, store, p, {
-      existing: input.mode !== 'run',
+    void execute(c, v, factory, runStore, p, {
+      existing: input.mode !== 'run' || recordedMigrationId === p.migration,
       verifyOnly: input.mode === 'verify',
       stop: () => cancelled,
       progress: (value) => {
@@ -284,7 +343,9 @@ export async function createWeb(
         error = category(e);
       })
       .finally(() => {
-        store.close();
+        recordedMigrationId = runStore.migrationId();
+        migrationId = recordedMigrationId ?? migrationId;
+        runStore.close();
         release();
         running = false;
       });
@@ -292,8 +353,17 @@ export async function createWeb(
   });
   app.post('/api/load', async (req) => {
     idle();
-    const { c } = ready();
-    const { migration } = z.object({ migration: z.string().uuid() }).strict().parse(req.body);
+    const { migration, folderPolicies } = z
+      .object({
+        migration: z.string().uuid(),
+        folderPolicies: z
+          .array(z.object({ id: z.string(), folders: folderPolicy }).strict())
+          .optional(),
+      })
+      .strict()
+      .parse(req.body);
+    plan = undefined;
+    const { c } = withPolicies(folderPolicies);
     const release = lock(c.stateDirectory);
     let store: Store | undefined;
     try {
@@ -301,6 +371,7 @@ export async function createWeb(
       plan = store.plan(migration);
       checkPlan(plan, c);
       lastReport = report(store, migration);
+      recordedMigrationId = migrationId = migration;
       return { plan, report: lastReport };
     } finally {
       store?.close();

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 import {
@@ -41,7 +41,7 @@ type Plan = {
     quota: unknown;
     warnings: string[];
     mappings: {
-      source: { path: string; count?: number };
+      source: { path: string; count?: number; selectable: boolean };
       target: string;
       excluded?: string;
       existing?: object;
@@ -70,6 +70,8 @@ type Report = {
 };
 type Session = {
   running: boolean;
+  migrationId?: string;
+  recordedMigrationId?: string;
   plan?: Plan;
   report?: Report;
   error?: string;
@@ -145,15 +147,22 @@ function App() {
     [budget, setBudget] = useState(512),
     [maxOccurrences, setMaxOccurrences] = useState(5000),
     [overrideDrafts, setOverrideDrafts] = useState<Record<number, string>>({}),
+    [exclusionDrafts, setExclusionDrafts] = useState<Record<number, string>>({}),
     [needsSession, setNeedsSession] = useState(!getSessionToken()),
     [sessionLink, setSessionLink] = useState(''),
     [sessionRevision, setSessionRevision] = useState(0),
     [startingPlan, setStartingPlan] = useState(false),
+    [planDirty, setPlanDirty] = useState(true),
     [discoveryError, setDiscoveryError] = useState('');
+  const pendingDiscovery = useRef<string | undefined>(undefined);
   const plan = session.plan,
     report = session.report;
   const discovering = startingPlan || session.discovery?.status === 'running';
   const disabled = busy || session.running || needsSession || discovering;
+  const resuming = !!plan && session.recordedMigrationId === plan.migration;
+  useEffect(() => {
+    if (session.migrationId) setMigration(session.migrationId);
+  }, [session.migrationId]);
   function handleFailure(e: unknown) {
     if (e instanceof SessionExpired) {
       if (e.obsolete) return;
@@ -183,7 +192,17 @@ function App() {
     const poll = () => {
       api<Session>('session')
         .then((s) => {
-          if (live) setSession(s);
+          if (live) {
+            setSession(s);
+            if (
+              s.plan &&
+              s.discovery?.status === 'complete' &&
+              s.discovery.startedAt === pendingDiscovery.current
+            ) {
+              pendingDiscovery.current = undefined;
+              setPlanDirty(false);
+            }
+          }
         })
         .catch((e) => {
           if (live) handleFailure(e);
@@ -223,6 +242,29 @@ function App() {
     setPairs((old) => old.map((p, i) => (i === index ? { ...p, ...change } : p)));
     setReady(false);
     setConfirm(false);
+    invalidatePlan();
+  }
+  function invalidatePlan() {
+    pendingDiscovery.current = undefined;
+    setPlanDirty(true);
+    setConfirm(false);
+  }
+  function editPolicy(index: number, change: Pick<Pair, 'folders'>) {
+    setPairs((old) => old.map((p, i) => (i === index ? { ...p, ...change } : p)));
+    invalidatePlan();
+  }
+  function folderPolicies() {
+    return pairs.map((p, index) => {
+      const overrides = JSON.parse(overrideDrafts[index] ?? JSON.stringify(p.folders.overrides));
+      if (
+        !overrides ||
+        Array.isArray(overrides) ||
+        typeof overrides !== 'object' ||
+        Object.values(overrides).some((v) => typeof v !== 'string')
+      )
+        throw new Error('Folder overrides must map source names to destination names.');
+      return { id: p.id, folders: { ...p.folders, overrides } };
+    });
   }
   async function download(path: string, name: string) {
     const value = await api(path);
@@ -318,6 +360,7 @@ function App() {
                     onClick={() => {
                       setPairs(pairs.filter((_, i) => i !== index));
                       setOverrideDrafts({});
+                      setExclusionDrafts({});
                       setReady(false);
                     }}
                   >
@@ -392,66 +435,6 @@ function App() {
                   </div>
                 ))}
               </div>
-              <details>
-                <summary>Folder policy</summary>
-                <label>
-                  Exclude exact folder names (one per line)
-                  <textarea
-                    value={p.folders.exclude.join('\n')}
-                    onChange={(e) =>
-                      edit(index, {
-                        folders: {
-                          ...p.folders,
-                          exclude: e.target.value.split('\n').filter(Boolean),
-                        },
-                      })
-                    }
-                  />
-                </label>
-                <label>
-                  Folder overrides (JSON object)
-                  <textarea
-                    value={overrideDrafts[index] ?? JSON.stringify(p.folders.overrides)}
-                    onChange={(e) => {
-                      setOverrideDrafts((d) => ({ ...d, [index]: e.target.value }));
-                      setReady(false);
-                      setConfirm(false);
-                    }}
-                    onBlur={(e) => {
-                      try {
-                        const overrides = JSON.parse(e.target.value) as Record<string, string>;
-                        if (
-                          Array.isArray(overrides) ||
-                          typeof overrides !== 'object' ||
-                          overrides === null ||
-                          Object.values(overrides).some((v) => typeof v !== 'string')
-                        )
-                          throw Error();
-                        edit(index, { folders: { ...p.folders, overrides } });
-                      } catch {
-                        setError(
-                          'Folder overrides must be a JSON object of source names to destination names.',
-                        );
-                      }
-                    }}
-                  />
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={p.folders.labelStrategy === 'explicit-folders'}
-                    onChange={(e) =>
-                      edit(index, {
-                        folders: {
-                          ...p.folders,
-                          labelStrategy: e.target.checked ? 'explicit-folders' : 'unresolved',
-                        },
-                      })
-                    }
-                  />
-                  I reviewed virtual / label folders and accept the selected physical-copy scope.
-                </label>
-              </details>
             </article>
           ))}
           <div className="row">
@@ -507,28 +490,27 @@ function App() {
           <button
             onClick={() =>
               void perform(async () => {
-                const checkedPairs = pairs.map((p, index) => {
-                  const overrides = JSON.parse(
-                    overrideDrafts[index] ?? JSON.stringify(p.folders.overrides),
-                  );
-                  if (
-                    !overrides ||
-                    Array.isArray(overrides) ||
-                    typeof overrides !== 'object' ||
-                    Object.values(overrides).some((v) => typeof v !== 'string')
-                  )
-                    throw new Error('Folder overrides must map source names to destination names.');
-                  return { ...p, folders: { ...p.folders, overrides } };
-                });
-                const result = await api<{ ready: boolean; results: typeof tests }>('test', {
-                  mailboxes: checkedPairs,
+                invalidatePlan();
+                const result = await api<{
+                  ready: boolean;
+                  results: typeof tests;
+                  migrationId?: string;
+                  recordedMigrationId?: string;
+                }>('test', {
+                  mailboxes: pairs,
                   maxMessageMiB: limit,
                   memoryBudgetMiB: budget,
                   maxOccurrences,
                 });
                 setTests(result.results);
                 setReady(result.ready);
-                setSession({ running: false, progress: [] });
+                setSession({
+                  running: false,
+                  progress: [],
+                  migrationId: result.migrationId,
+                  recordedMigrationId: result.recordedMigrationId,
+                });
+                setMigration(result.migrationId ?? '');
                 setConfirm(false);
               })
             }
@@ -561,7 +543,7 @@ function App() {
               disabled={disabled}
               onChange={(e) => {
                 setPilot(e.target.value);
-                setConfirm(false);
+                invalidatePlan();
               }}
             />
           </label>
@@ -572,28 +554,119 @@ function App() {
               disabled={disabled}
               onChange={(e) => {
                 setMigration(e.target.value);
-                setConfirm(false);
+                invalidatePlan();
               }}
             />
           </label>
         </div>
+        <fieldset disabled={!ready || disabled}>
+          <legend>Folder policy</legend>
+          <p>
+            Discover folders first, then use the Include checkboxes below. Unchecking a folder adds
+            its exact name to exclusions. After changes, rebuild the plan and review it before
+            confirming.
+          </p>
+          {pairs.map((p, index) => (
+            <div key={index}>
+              <details open>
+                <summary>Folder policy · {p.id}</summary>
+                <label>
+                  Exclude exact folder names (one per line)
+                  <textarea
+                    aria-label={`${p.id} excluded folders`}
+                    value={exclusionDrafts[index] ?? p.folders.exclude.join('\n')}
+                    onChange={(e) => {
+                      setExclusionDrafts((d) => ({ ...d, [index]: e.target.value }));
+                      editPolicy(index, {
+                        folders: {
+                          ...p.folders,
+                          exclude: e.target.value.split('\n').filter(Boolean),
+                        },
+                      });
+                    }}
+                  />
+                </label>
+                <label>
+                  Folder overrides (JSON object)
+                  <textarea
+                    aria-label={`${p.id} folder overrides`}
+                    value={overrideDrafts[index] ?? JSON.stringify(p.folders.overrides)}
+                    onChange={(e) => {
+                      setOverrideDrafts((d) => ({ ...d, [index]: e.target.value }));
+                      invalidatePlan();
+                      setConfirm(false);
+                    }}
+                    onBlur={(e) => {
+                      try {
+                        const overrides = JSON.parse(e.target.value) as Record<string, string>;
+                        if (
+                          Array.isArray(overrides) ||
+                          typeof overrides !== 'object' ||
+                          overrides === null ||
+                          Object.values(overrides).some((v) => typeof v !== 'string')
+                        )
+                          throw Error();
+                        editPolicy(index, { folders: { ...p.folders, overrides } });
+                      } catch {
+                        setError(
+                          'Folder overrides must be a JSON object of source names to destination names.',
+                        );
+                      }
+                    }}
+                  />
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={p.folders.labelStrategy === 'explicit-folders'}
+                    onChange={(e) =>
+                      editPolicy(index, {
+                        folders: {
+                          ...p.folders,
+                          labelStrategy: e.target.checked ? 'explicit-folders' : 'unresolved',
+                        },
+                      })
+                    }
+                  />
+                  I reviewed virtual / label folders and accept the selected physical-copy scope.
+                </label>
+              </details>
+            </div>
+          ))}
+        </fieldset>
+        {planDirty && plan && (
+          <p role="status" className="warning">
+            Folder policy or scope has changed. Click Discover folders &amp; build plan to update
+            counts and exclusions before approval. No connection retest is needed.
+          </p>
+        )}
         <div className="row">
           <button
             disabled={!ready || disabled}
             onClick={() =>
               void perform(async () => {
+                invalidatePlan();
                 setStartingPlan(true);
                 setConfirm(false);
                 setDiscoveryError('');
                 setSession((s) => ({ ...s, plan: undefined, discovery: undefined }));
                 try {
-                  const result = await api<{ discovery: Discovery }>('plan', {
+                  const result = await api<{
+                    discovery: Discovery;
+                    migrationId: string;
+                    recordedMigrationId?: string;
+                  }>('plan', {
                     ...(pilot ? { pilot: Number(pilot) } : {}),
                     ...(migration ? { migration } : {}),
+                    folderPolicies: folderPolicies(),
                   });
+                  pendingDiscovery.current = result.discovery.startedAt;
+                  setMigration(result.migrationId);
                   setSession((s) => ({
                     ...s,
                     discovery: result.discovery,
+                    migrationId: result.migrationId,
+                    recordedMigrationId: result.recordedMigrationId,
                     plan: undefined,
                     report: undefined,
                   }));
@@ -614,12 +687,25 @@ function App() {
           </button>
           <button
             className="secondary"
-            disabled={!ready || !migration || disabled}
+            disabled={!ready || !migration || migration !== session.recordedMigrationId || disabled}
             onClick={() =>
               void perform(async () => {
-                const loaded = await api<{ plan: Plan; report: Report }>('load', { migration });
+                invalidatePlan();
+                const loaded = await api<{ plan: Plan; report: Report }>('load', {
+                  migration,
+                  folderPolicies: folderPolicies(),
+                });
                 setSession((s) => ({ ...s, ...loaded }));
+                setMigration(loaded.plan.migration);
+                setSession((s) => ({
+                  ...s,
+                  migrationId: loaded.plan.migration,
+                  recordedMigrationId: loaded.plan.migration,
+                }));
+                setPilot(loaded.plan.scope.pilot?.toString() ?? '');
                 setConfirm(false);
+                pendingDiscovery.current = undefined;
+                setPlanDirty(false);
               })
             }
           >
@@ -684,6 +770,7 @@ function App() {
                   <table>
                     <thead>
                       <tr>
+                        <th>Include</th>
                         <th>Source folder</th>
                         <th>Destination</th>
                         <th>Observed</th>
@@ -694,20 +781,57 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {p.mappings.map((m, i) => (
-                        <tr key={i}>
-                          <td>{m.source.path}</td>
-                          <td>{m.target}</td>
-                          <td>{m.source.count ?? 'unknown'}</td>
-                          <td>{m.messages.length}</td>
-                          <td>{m.bytes.toLocaleString()}</td>
-                          <td>{m.oversized}</td>
-                          <td>
-                            {m.excluded ??
-                              (m.existing ? 'Append; preserve existing' : 'Create and append')}
-                          </td>
-                        </tr>
-                      ))}
+                      {p.mappings.map((m, i) => {
+                        const index = pairs.findIndex((pair) => pair.id === p.id);
+                        const draft = pairs[index];
+                        const fixedExclusion =
+                          !m.source.selectable ||
+                          (m.excluded !== undefined && m.excluded !== 'explicit_exclusion');
+                        const included =
+                          !!draft &&
+                          !fixedExclusion &&
+                          !draft.folders.exclude.includes(m.source.path);
+                        return (
+                          <tr key={i}>
+                            <td>
+                              <input
+                                type="checkbox"
+                                aria-label={`Include ${p.id} ${m.source.path}`}
+                                checked={included}
+                                disabled={!ready || disabled || fixedExclusion || !draft}
+                                onChange={(e) => {
+                                  if (!draft) return;
+                                  const exclude = draft.folders.exclude.filter(
+                                    (name) => name !== m.source.path,
+                                  );
+                                  if (!e.target.checked) exclude.push(m.source.path);
+                                  setExclusionDrafts((d) => ({
+                                    ...d,
+                                    [index]: exclude.join('\n'),
+                                  }));
+                                  editPolicy(index, { folders: { ...draft.folders, exclude } });
+                                }}
+                              />
+                            </td>
+                            <td>{m.source.path}</td>
+                            <td>{m.target}</td>
+                            <td>{m.source.count ?? 'unknown'}</td>
+                            <td>{planDirty ? 'Rebuild required' : m.messages.length}</td>
+                            <td>{planDirty ? '—' : m.bytes.toLocaleString()}</td>
+                            <td>{planDirty ? '—' : m.oversized}</td>
+                            <td>
+                              {planDirty
+                                ? fixedExclusion
+                                  ? m.excluded
+                                  : included
+                                    ? 'Include after rebuild'
+                                    : 'Exclude after rebuild'
+                                : (m.excluded ??
+                                  (m.existing ? 'Append; preserve existing' : 'Create and append'))}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -715,6 +839,7 @@ function App() {
             ))}
             <button
               className="secondary"
+              disabled={disabled || planDirty || !ready}
               onClick={() => void perform(() => download('plan/download', 'migration-plan.json'))}
             >
               Download private plan
@@ -732,7 +857,7 @@ function App() {
           <input
             type="checkbox"
             checked={confirm}
-            disabled={!ready || !plan || disabled}
+            disabled={!ready || !plan || planDirty || disabled}
             onChange={(e) => setConfirm(e.target.checked)}
           />
           I reviewed this plan’s accounts, folders and scope. I approve creating required
@@ -740,24 +865,26 @@ function App() {
         </label>
         <div className="row">
           <button
-            disabled={!ready || !plan || !confirm || !!plan.blockers.length || disabled}
+            disabled={
+              !ready || !plan || planDirty || !confirm || !!plan.blockers.length || disabled
+            }
             onClick={() =>
               void perform(async () => {
                 await api('run', {
                   hash: plan!.hash,
                   confirm: true,
-                  mode: migration ? 'resume' : 'run',
+                  mode: resuming ? 'resume' : 'run',
                 });
                 setSession((s) => ({ ...s, running: true }));
                 setConfirm(false);
               })
             }
           >
-            {migration ? 'Resume / run catch-up' : 'Start migration'}
+            {resuming ? 'Resume / run catch-up' : 'Start migration'}
           </button>
           <button
             className="secondary"
-            disabled={!ready || !plan || disabled}
+            disabled={!ready || !plan || planDirty || disabled}
             onClick={() =>
               void perform(async () => {
                 await api('run', { hash: plan!.hash, confirm: true, mode: 'verify' });
