@@ -50,6 +50,21 @@ node dist/cli.js web --state-dir C:\PrivateMail\state --report-dir C:\PrivateMai
 
 The local UI uses React/Vite and a Fastify backend bound to `127.0.0.1` by default. Docker uses an explicit `--host 0.0.0.0` override inside the container with a loopback-only published port. Credentials remain in browser form/backend memory, not browser persistent storage or SQLite. Password fields, RAM, process dumps and swap are not a secure vault. Protect the machine and private directories; see the [operator runbook](docs/RUNBOOK.md).
 
+## Store locally and append later
+
+The browser has three tabs: **Direct migration**, **Store locally**, and **Append from local storage**.
+
+1. In **Store locally**, enter the source IMAP settings and test the connection. Review the returned folders and select those to store.
+2. Enter a new named archive folder, such as `C:\PrivateMail\festival-backup`. Its parent must already exist; the app refuses to overwrite an existing folder. Click **Download and store emails** and wait for completion. Progress and cancellation are available.
+3. Keep the entire folder together: `archive.json` describes the original account, folder paths, message dates, flags, sizes and SHA-256 hashes; `messages/` contains the raw `.eml` files. Passwords are not included. Mail content is unencrypted, so protect this folder like the original mailbox.
+4. In **Append from local storage**, enter the saved folder path and click **Open archive folder**. The app reads its manifest and displays its origin and contents. Enter only the destination IMAP credentials, validate the connection, then discover and review the plan. Adjust folder selections or mappings and explicitly confirm before copying.
+
+Paths refer to storage on the machine running the backend, not a remote browser's computer. The archive can be moved between Windows and Linux by copying the complete folder. Opening it validates its manifest; message bytes and checksums are checked before each append. Import uses the existing append verification and recovery ledger. Retain the state directory to resume without recopying verified messages; archive/destination pairs have separate ledgers under `state/local-imports`, independent of direct migration. A fresh ledger cannot recognize a previous import automatically.
+
+Exports respect the configured message and inventory limits. Failed or cancelled exports retain an `INCOMPLETE.txt` marker and cannot be imported; retry into a new folder. Export resume and incremental archive updates are not implemented. These tabs support archives created by this app, not arbitrary folders of email files.
+
+In Docker, new volumes include `/data/archives`: use a path such as `/data/archives/festival-backup` to keep mail in the persistent data volume. For an older volume, create that parent directory with permissions for the container's `node` user, or use another writable mounted folder. Host paths must be mounted into the container before they can be opened.
+
 ## Run with Docker
 
 The root Dockerfile uses `node:24`, builds the backend and browser assets, and runs the compiled app as the non-root `node` user with production dependencies only. The build context excludes local configuration, secrets, migration state, reports and Windows `node_modules`.

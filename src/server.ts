@@ -5,12 +5,20 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { type Config, type Endpoint, validateConfig } from './config.js';
+import { type Config, type Endpoint, validateConfig, identity } from './config.js';
+import {
+  ArchiveReader,
+  archiveSource,
+  archiveSummary,
+  exportArchive,
+  openArchive,
+  type ArchiveProgress,
+} from './archive.js';
 import { discoverSnapshot, planFromSnapshot, checkPlan } from './plan.js';
 import { imapFactory, type Factory } from './transport.js';
 import { Store, lock, privateDir, writePrivate } from './store.js';
 import { execute, report, resolveItem, type Progress } from './engine.js';
-import { Fault, category, errorPayload } from './safety.js';
+import { Fault, category, errorPayload, hash, canonical } from './safety.js';
 import { validationIssues } from './validation.js';
 import type { Plan, DiscoverySnapshot } from './model.js';
 import type { Discovery } from './discovery.js';
@@ -32,7 +40,7 @@ const folderPolicy = z
     labelStrategy: z.enum(['unresolved', 'explicit-folders']),
   })
   .strict();
-function withoutPassword(input: z.infer<typeof inputEndpoint>, ref: string) {
+function withoutPassword(input: z.infer<typeof inputEndpoint>, ref: string): Endpoint {
   const { password, ...endpoint } = input;
   return { ...endpoint, auth: { type: 'password', secretRef: 'env:' + ref } };
 }
@@ -46,6 +54,7 @@ const setup = z
             source: inputEndpoint,
             destination: inputEndpoint,
             folders: folderPolicy,
+            archivePath: z.string().min(1).optional(),
           })
           .strict(),
       )
@@ -65,12 +74,14 @@ export async function createWeb(
   const app = Fastify({ logger: false, bodyLimit: 256 * 1024 });
   const token = randomBytes(32).toString('hex');
   const origin = `http://127.0.0.1:${port}`;
+  let activeStateDirectory = stateDirectory;
+  let activeFactory = factory;
   const readRecordedMigration = () => {
-    if (!existsSync(join(stateDirectory, 'ledger.sqlite'))) return undefined;
-    const release = lock(stateDirectory);
+    if (!existsSync(join(activeStateDirectory, 'ledger.sqlite'))) return undefined;
+    const release = lock(activeStateDirectory);
     let store: Store | undefined;
     try {
-      store = new Store(stateDirectory);
+      store = new Store(activeStateDirectory);
       return store.migrationId();
     } finally {
       store?.close();
@@ -90,8 +101,12 @@ export async function createWeb(
   let discovery: Discovery | undefined;
   let snapshot: DiscoverySnapshot | undefined;
   let discoveryController: AbortController | undefined;
+  let archiveProgress: ArchiveProgress | undefined;
+  let archiveController: AbortController | undefined;
+  let exportCredentials: { config: Config; source: Endpoint; secret: string } | undefined;
   const cancel = () => {
     cancelled = true;
+    archiveController?.abort();
     if (discovery?.status === 'running') {
       discovery = { ...discovery, phase: 'cancelling', updatedAt: new Date().toISOString() };
       discoveryController?.abort();
@@ -135,6 +150,7 @@ export async function createWeb(
   const idle = () => {
     if (running) throw new Fault('migration_running');
     if (discovery?.status === 'running') throw new Fault('discovery_running');
+    if (archiveProgress?.status === 'running') throw new Fault('archive_export_running');
   };
   const ready = () => {
     if (!config || !values) throw new Fault('test_connections_first');
@@ -176,6 +192,7 @@ export async function createWeb(
     discovery,
     migrationId,
     recordedMigrationId,
+    archiveProgress,
     snapshot: snapshot && { id: snapshot.id, created: snapshot.created },
   }));
   app.post('/api/test', async (req) => {
@@ -192,22 +209,58 @@ export async function createWeb(
     if (!parsed.success)
       throw new Fault('invalid_connection_form', 3, validationIssues(parsed.error, 'form'));
     const body = parsed.data;
+    const archives = body.mailboxes.map((m) =>
+      m.archivePath ? openArchive(m.archivePath) : undefined,
+    );
+    if (archives.some(Boolean) && (body.mailboxes.length !== 1 || !archives[0]))
+      throw new Fault('one_archive_per_import');
+    const selectedArchive = archives[0];
+    const nextState = selectedArchive
+      ? join(
+          stateDirectory,
+          'local-imports',
+          hash(
+            canonical({
+              archive: selectedArchive.digest,
+              destination: identity(
+                withoutPassword(body.mailboxes[0]!.destination, 'UI_DESTINATION'),
+              ),
+            }),
+          ),
+        )
+      : stateDirectory;
+    if (activeStateDirectory !== nextState) {
+      migrationId = undefined;
+      recordedMigrationId = undefined;
+    }
+    activeStateDirectory = nextState;
     const c = validateConfig({
       version: 1,
-      stateDirectory,
+      stateDirectory: activeStateDirectory,
       reportDirectory,
       defaults: {
         maxMessageBytes: body.maxMessageMiB * 1024 * 1024,
         memoryBudgetMiB: body.memoryBudgetMiB,
         maxOccurrences: body.maxOccurrences,
       },
-      mailboxes: body.mailboxes.map((m) => ({
+      mailboxes: body.mailboxes.map((m, i) => ({
         id: m.id,
-        source: withoutPassword(m.source, 'UI_SOURCE'),
+        source: archives[i] ? archiveSource(archives[i]!) : withoutPassword(m.source, 'UI_SOURCE'),
         destination: withoutPassword(m.destination, 'UI_DESTINATION'),
         folders: m.folders,
       })),
     });
+    activeFactory = (endpoint, secret, writable, config) => {
+      if (
+        selectedArchive &&
+        endpoint.host === 'local-archive.invalid' &&
+        endpoint.username === archiveSource(selectedArchive).username
+      ) {
+        if (writable) throw new Fault('archive_is_read_only');
+        return new ArchiveReader(selectedArchive);
+      }
+      return factory(endpoint, secret, writable, config);
+    };
     // Strip passwords before strict validation rather than ever retaining them in config.
     const v = new Map<Endpoint, string>();
     const results: { mailbox: string; side: string; ok: boolean; error?: string }[] = [];
@@ -215,7 +268,7 @@ export async function createWeb(
       for (const side of ['source', 'destination'] as const) {
         const endpoint = c.mailboxes[i]![side];
         v.set(endpoint, body.mailboxes[i]![side].password);
-        const client = factory(endpoint, v.get(endpoint)!, false, c);
+        const client = activeFactory(endpoint, v.get(endpoint)!, false, c);
         try {
           await client.connect();
           await client.list();
@@ -272,7 +325,7 @@ export async function createWeb(
     void discoverSnapshot(
       c,
       v,
-      factory,
+      activeFactory,
       { pilot: scope.pilot, mailbox: scope.mailbox },
       migrationId,
       {
@@ -374,7 +427,7 @@ export async function createWeb(
     cancelled = false;
     error = undefined;
     progress = [];
-    void execute(c, v, factory, runStore, p, {
+    void execute(c, v, activeFactory, runStore, p, {
       existing: input.mode !== 'run' || recordedMigrationId === p.migration,
       verifyOnly: input.mode === 'verify',
       stop: () => cancelled,
@@ -452,7 +505,7 @@ export async function createWeb(
     try {
       store = new Store(c.stateDirectory);
       checkPlan(store.plan(input.migration), c);
-      await resolveItem(c, v, factory, store, input.migration, input.item, input);
+      await resolveItem(c, v, activeFactory, store, input.migration, input.item, input);
       lastReport = report(store, input.migration);
       return lastReport;
     } finally {
@@ -463,6 +516,90 @@ export async function createWeb(
   app.post('/api/cancel', async () => {
     cancel();
     return { cancellationRequested: true };
+  });
+  app.post('/api/archive/open', async (req) => {
+    idle();
+    const { path } = z
+      .object({ path: z.string().min(1) })
+      .strict()
+      .parse(req.body);
+    return archiveSummary(openArchive(path));
+  });
+  app.post('/api/archive/test', async (req) => {
+    idle();
+    exportCredentials = undefined;
+    const body = z
+      .object({
+        source: inputEndpoint,
+        maxMessageMiB: z.number().int().min(1).max(100).default(25),
+        maxOccurrences: z.number().int().min(1).max(100000).default(5000),
+        memoryBudgetMiB: z.number().int().min(256).max(8192).default(512),
+      })
+      .strict()
+      .parse(req.body);
+    const source = withoutPassword(body.source, 'ARCHIVE_SOURCE');
+    const c = validateConfig({
+      version: 1,
+      stateDirectory,
+      reportDirectory,
+      defaults: {
+        maxMessageBytes: body.maxMessageMiB * 1024 * 1024,
+        maxOccurrences: body.maxOccurrences,
+        memoryBudgetMiB: body.memoryBudgetMiB,
+      },
+      mailboxes: [
+        {
+          id: 'archive',
+          source,
+          destination: { ...source, host: 'unused-destination.invalid', username: 'unused' },
+        },
+      ],
+    });
+    const endpoint = c.mailboxes[0]!.source;
+    const reader = factory(endpoint, body.source.password, false, c);
+    try {
+      await reader.connect();
+      const folders = await reader.list();
+      exportCredentials = { config: c, source: endpoint, secret: body.source.password };
+      return { ready: true, folders };
+    } finally {
+      await reader.close();
+    }
+  });
+  app.get('/api/archive/status', async () => archiveProgress ?? { status: 'idle' });
+  app.post('/api/archive/export', async (req, reply) => {
+    idle();
+    if (!exportCredentials) throw new Fault('test_archive_source_first');
+    const body = z
+      .object({ path: z.string().min(1), exclude: z.array(z.string().min(1)).default([]) })
+      .strict()
+      .parse(req.body);
+    const job = exportCredentials;
+    archiveProgress = { status: 'running', directory: body.path, messages: 0, bytes: 0 };
+    archiveController = new AbortController();
+    void exportArchive(
+      job.config,
+      job.source,
+      job.secret,
+      factory,
+      body.path,
+      body.exclude,
+      (p) => {
+        archiveProgress = p;
+      },
+      archiveController.signal,
+    )
+      .catch((e) => {
+        archiveProgress = {
+          ...archiveProgress!,
+          status: category(e) === 'discovery_cancelled' ? 'cancelled' : 'failed',
+          error: category(e),
+        };
+      })
+      .finally(() => {
+        archiveController = undefined;
+      });
+    return reply.code(202).send({ started: true });
   });
   app.get('/api/report', async (_req, reply) => {
     reply.header('Content-Disposition', 'attachment; filename="migration-report.json"');
@@ -483,7 +620,8 @@ export async function createWeb(
     app,
     token,
     cancel,
-    isRunning: () => running || discovery?.status === 'running',
+    isRunning: () =>
+      running || discovery?.status === 'running' || archiveProgress?.status === 'running',
   };
 }
 export async function startWeb(port: number, state: string, reports: string, host = '127.0.0.1') {

@@ -1,4 +1,4 @@
-# Verification evidence — 19 September 2026
+# Verification evidence — 20 September 2026
 
 Environment: Windows, PowerShell, Node 24.11.0, npm 11.19.0, ImapFlow 2.0.5. The workspace was initially empty and was not a Git checkout. No production credentials or real mailboxes were used.
 
@@ -6,8 +6,8 @@ Environment: Windows, PowerShell, Node 24.11.0, npm 11.19.0, ImapFlow 2.0.5. The
 | ----------------------------------------------- | ------------------------------------------------------------------ |
 | `npm run check`                                 | TypeScript backend and React UI passed                             |
 | `npm run build`                                 | Backend and production UI bundle built                             |
-| `npm test`                                      | **52 passed**, 0 failed, 0 skipped                                 |
-| `npm run test:ui` with installed Microsoft Edge | **10 passed**                                                      |
+| `npm test`                                      | **55 passed**, 0 failed, 0 skipped                                 |
+| `npm run test:ui` with installed Microsoft Edge | **12 passed**                                                      |
 | CLI `--help` and example `validate`             | Passed                                                             |
 | `npm run integration` without opt-in            | **1 explicitly skipped**, 0 passed                                 |
 | Docker availability                             | CLI installed; Linux engine named pipe missing, daemon unavailable |
@@ -25,6 +25,8 @@ Folder-selection regressions verify that policy controls are in section 2, check
 Migration ID regressions verify automatic field population, stable IDs across plan rebuilds, ledger ID recovery after backend restart, rejection of an unrelated ID, and resume without recopying verified messages. All ten browser tests passed, including changing selections and resuming after the first copy.
 
 Snapshot regressions verify that full pilot inventory is retained, local selection changes do not mutate the snapshot, selected byte totals are recalculated, newly arrived mail is not silently added, mapping and label rules are revalidated, and never-inventoried folders require refresh. The API test counts transport adapters to prove that local rebuilding makes zero IMAP calls, rejects old approval hashes and refuses invalidated snapshots. Browser tests assert a single discovery request across checkbox and pilot edits, delay a rebuild response to exercise polling races, preserve per-pair exclusions and verify the explicit refresh path for an unscanned folder. The updated folder-selection screenshot was visually inspected.
+
+Local archive tests cover byte-for-byte round trips, duplicate occurrences, international folder names, flags and dates, moving the archive folder, credential omission, repeat-import idempotency, corrupt content, unsafe manifest paths, changed manifests, existing-folder protection, incomplete/cancelled exports, size limits and exclusions. The browser test exports synthetic mail, opens its archive, enters destination credentials, reviews the plan and confirms a verified import. `test-results/local-archive.png` was visually inspected. These tests do not establish real-provider interoperability or disk-full/power-loss durability.
 
 ## Measured synthetic memory test
 

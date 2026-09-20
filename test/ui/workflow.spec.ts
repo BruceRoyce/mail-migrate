@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 test('folder edits automatically rebuild from the snapshot without discovery or connection tests', async ({
   page,
@@ -500,4 +501,57 @@ test('recovery controls offer only actions supported by each recorded message st
   expect(action?.retryRead).toBe(true);
   expect(action?.appendAgain).toBeUndefined();
   expect(action?.acceptDuplicateRisk).toBeUndefined();
+});
+
+test('store locally exports a portable archive and imports it through the destination approval flow', async ({
+  page,
+}) => {
+  const { token, archiveRoot } = JSON.parse(readFileSync('test/ui-session.json', 'utf8'));
+  await page.goto('/#' + token);
+  await page.getByRole('tab', { name: 'Store locally', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Store emails locally' })).toBeVisible();
+  await expect(page.getByLabel('mailbox-1 destination host', { exact: true })).toHaveCount(0);
+  await page.getByLabel('Archive source host', { exact: true }).fill('old.example');
+  await page
+    .getByLabel('Archive source username', { exact: true })
+    .fill('synthetic@business.example');
+  await page.getByLabel('Archive source password', { exact: true }).fill('synthetic-only');
+  await page.getByRole('button', { name: 'Test source and list folders' }).click();
+  await expect(page.getByText('Source connection passed.', { exact: false })).toBeVisible();
+  await expect(
+    page.getByRole('checkbox', { name: 'Store Container only', exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByLabel('New archive folder path', { exact: true })
+    .fill(join(archiveRoot, 'ui-archive'));
+  await page.getByRole('button', { name: 'Download and store emails' }).click();
+  await expect(page.getByText('Local archive complete', { exact: true })).toBeVisible();
+  await expect(page.getByText('2 messages stored', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Open in Append from local storage' }).click();
+  await page.getByRole('button', { name: 'Open archive folder', exact: true }).click();
+  await expect(page.getByText('Archive manifest loaded', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('mailbox-1 source password', { exact: true })).toHaveCount(0);
+  await page.getByLabel('mailbox-1 destination host', { exact: true }).fill('new.example');
+  await page
+    .getByLabel('mailbox-1 destination username', { exact: true })
+    .fill('archive-destination@business.example');
+  await page.getByLabel('mailbox-1 destination password', { exact: true }).fill('synthetic-only');
+  await page.getByRole('button', { name: 'Validate archive and test destination' }).click();
+  await expect(
+    page.getByText('Archive manifest and folder access passed', { exact: false }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Discover folders & build plan', exact: true }).click();
+  await expect(
+    page.getByRole('checkbox', { name: 'Include mailbox-1 Clients/日本語', exact: true }),
+  ).toBeChecked();
+  await expect(page.getByRole('button', { name: 'Start migration', exact: true })).toBeDisabled();
+  await page
+    .getByLabel('I reviewed this plan’s accounts, folders and scope.', { exact: false })
+    .check();
+  await page.getByRole('button', { name: 'Start migration', exact: true }).click();
+  await expect(
+    page.getByRole('heading', { name: 'content complete for recorded scope' }),
+  ).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.screenshot({ path: 'test-results/local-archive.png', fullPage: true });
 });

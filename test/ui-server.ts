@@ -38,5 +38,5 @@ const factory: Factory = (endpoint, secret, writable, config) => {
   return reader;
 };
 const w = await createWeb(8788, f.c.stateDirectory, f.c.reportDirectory, factory);
-writeFileSync('test/ui-session.json', JSON.stringify({ token: w.token }));
+writeFileSync('test/ui-session.json', JSON.stringify({ token: w.token, archiveRoot: f.base }));
 await w.app.listen({ port: 8788, host: '127.0.0.1' });

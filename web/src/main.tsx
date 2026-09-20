@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
+import { ArchiveExport } from './ArchiveExport';
 import {
   getSessionToken,
   setSessionToken,
@@ -21,6 +22,7 @@ type Pair = {
   id: string;
   source: Endpoint;
   destination: Endpoint;
+  archivePath?: string;
   folders: {
     exclude: string[];
     overrides: Record<string, string>;
@@ -76,6 +78,7 @@ type Session = {
   migrationId?: string;
   recordedMigrationId?: string;
   snapshot?: { id: string; created: string };
+  archiveProgress?: { status: string };
   plan?: Plan;
   report?: Report;
   error?: string;
@@ -138,6 +141,17 @@ const pair = (n: number): Pair => ({
   folders: { exclude: [], overrides: {}, labelStrategy: 'unresolved' },
 });
 function App() {
+  const [tab, setTab] = useState<'direct' | 'store' | 'import'>('direct');
+  const [exportBusy, setExportBusy] = useState(false);
+  const [archivePath, setArchivePath] = useState('');
+  const [archive, setArchive] = useState<{
+    id: string;
+    directory: string;
+    created: string;
+    source: Endpoint;
+    folders: { path: string; messages: number; bytes: number }[];
+  }>();
+  const importMode = tab === 'import';
   const [pairs, setPairs] = useState<Pair[]>([pair(1)]),
     [ready, setReady] = useState(false),
     [busy, setBusy] = useState(false),
@@ -352,6 +366,18 @@ function App() {
     a.click();
     URL.revokeObjectURL(url);
   }
+  function switchTab(next: typeof tab) {
+    setTab(next);
+    setReady(false);
+    invalidatePlan();
+    setPairs([pair(1)]);
+    setArchive(undefined);
+    setOverrideDrafts({});
+    setExclusionDrafts({});
+    setTests([]);
+    setError('');
+    setSession({ running: false, progress: [] });
+  }
   return (
     <main>
       <header>
@@ -362,12 +388,34 @@ function App() {
           destination evidence.
         </p>
       </header>
-      <nav aria-label="Workflow">
-        <span>1 · Connect</span>
-        <span>2 · Review</span>
-        <span>3 · Confirm</span>
-        <span>4 · Verify</span>
-      </nav>
+      <div role="tablist" aria-label="Email transfer mode" className="row">
+        {(['direct', 'store', 'import'] as const).map((mode) => (
+          <button
+            key={mode}
+            role="tab"
+            aria-selected={tab === mode}
+            className={tab === mode ? '' : 'secondary'}
+            disabled={disabled || exportBusy || session.archiveProgress?.status === 'running'}
+            onClick={() => switchTab(mode)}
+          >
+            {
+              {
+                direct: 'Direct migration',
+                store: 'Store locally',
+                import: 'Append from local storage',
+              }[mode]
+            }
+          </button>
+        ))}
+      </div>
+      {tab !== 'store' && (
+        <nav aria-label="Workflow">
+          <span>1 · Connect</span>
+          <span>2 · Review</span>
+          <span>3 · Confirm</span>
+          <span>4 · Verify</span>
+        </nav>
+      )}
       {needsSession && (
         <section aria-labelledby="session-heading">
           <h2 id="session-heading">Reconnect to the local app</h2>
@@ -403,699 +451,812 @@ function App() {
           {error || session.error}
         </div>
       )}
-      <section>
-        <h2>1. Test your connections</h2>
-        <p>
-          Credentials stay in the local backend’s memory. No mailbox passwords are saved to disk.
-          Use an app password if required by your provider.
-        </p>
-        <p>
-          This form uses the settings entered below. It does not load migration.yaml; that file is
-          used by CLI commands.
-        </p>
-        <fieldset disabled={disabled}>
-          <legend className="sr-only">Connection settings</legend>
-          {pairs.map((p, index) => (
-            <article key={index}>
-              <div className="row">
+      {tab === 'store' ? (
+        <ArchiveExport
+          api={api}
+          disabled={needsSession || session.running || discovering}
+          onError={handleFailure}
+          onBusy={setExportBusy}
+          onOpen={(path) => {
+            switchTab('import');
+            setArchivePath(path);
+          }}
+        />
+      ) : (
+        <>
+          <section>
+            <h2>
+              {importMode ? '1. Open archive and test destination' : '1. Test your connections'}
+            </h2>
+            <p>
+              Credentials stay in the local backend’s memory. No mailbox passwords are saved to
+              disk. Use an app password if required by your provider.
+            </p>
+            {importMode && (
+              <>
                 <label>
-                  Mailbox identifier
+                  Local archive folder
                   <input
-                    aria-label={`Mailbox identifier ${index + 1}`}
-                    value={p.id}
-                    onChange={(e) => edit(index, { id: e.target.value })}
+                    aria-label="Local archive folder"
+                    value={archivePath}
+                    disabled={disabled}
+                    onChange={(e) => {
+                      setArchivePath(e.target.value);
+                      setArchive(undefined);
+                      setReady(false);
+                      invalidatePlan();
+                    }}
                   />
-                  <small>
-                    Short label, e.g. support. Letters, digits, underscores and hyphens only.
-                  </small>
                 </label>
-                {pairs.length > 1 && (
+                <p>
+                  Enter the folder containing archive.json. Use a path on the machine running this
+                  app, or a mounted path inside Docker.
+                </p>
+                <button
+                  disabled={disabled || !archivePath.trim()}
+                  onClick={() =>
+                    void perform(async () => {
+                      const opened = await api<NonNullable<typeof archive>>('archive/open', {
+                        path: archivePath,
+                      });
+                      setArchive(opened);
+                      setReady(false);
+                      invalidatePlan();
+                      setPairs([
+                        {
+                          ...pair(1),
+                          destination: pairs[0]!.destination,
+                          archivePath: opened.directory,
+                          source: {
+                            ...endpoint(),
+                            host: 'local-archive.invalid',
+                            username: opened.id,
+                            password: 'local-archive',
+                          },
+                        },
+                      ]);
+                    })
+                  }
+                >
+                  Open archive folder
+                </button>
+                {archive && (
+                  <div className="success">
+                    <strong>Archive manifest loaded</strong>
+                    <p>
+                      {archive.source.username} @ {archive.source.host} · {archive.created}
+                    </p>
+                    <p>
+                      {archive.folders.length} folders ·{' '}
+                      {archive.folders.reduce((n, f) => n + f.messages, 0)} messages
+                    </p>
+                    <ul>
+                      {archive.folders.map((f) => (
+                        <li key={f.path}>
+                          {f.path}: {f.messages} messages · {f.bytes.toLocaleString()} bytes
+                        </li>
+                      ))}
+                    </ul>
+                    <p>
+                      Message checksums are verified before each append. The archive is read-only.
+                    </p>
+                  </div>
+                )}
+              </>
+            )}
+            <p>
+              This form uses the settings entered below. It does not load migration.yaml; that file
+              is used by CLI commands.
+            </p>
+            <fieldset disabled={disabled}>
+              <legend className="sr-only">Connection settings</legend>
+              {pairs.map((p, index) => (
+                <article key={index}>
+                  <div className="row">
+                    <label>
+                      Mailbox identifier
+                      <input
+                        aria-label={`Mailbox identifier ${index + 1}`}
+                        value={p.id}
+                        onChange={(e) => edit(index, { id: e.target.value })}
+                      />
+                      <small>
+                        Short label, e.g. support. Letters, digits, underscores and hyphens only.
+                      </small>
+                    </label>
+                    {pairs.length > 1 && (
+                      <button
+                        className="secondary"
+                        onClick={() => {
+                          setPairs(pairs.filter((_, i) => i !== index));
+                          setOverrideDrafts({});
+                          setExclusionDrafts({});
+                          setReady(false);
+                        }}
+                      >
+                        Remove pair
+                      </button>
+                    )}
+                  </div>
+                  <div className="columns">
+                    {(importMode
+                      ? (['destination'] as const)
+                      : (['source', 'destination'] as const)
+                    ).map((side) => (
+                      <div key={side}>
+                        <h3>
+                          {side === 'source' ? 'Source · old host' : 'Destination · new host'}
+                        </h3>
+                        {(['host', 'username', 'password'] as const).map((field) => (
+                          <label key={field}>
+                            {field === 'host'
+                              ? 'IMAP hostname'
+                              : field === 'username'
+                                ? 'Username'
+                                : 'Password / app password'}
+                            <input
+                              aria-label={`${p.id} ${side} ${field}`}
+                              type={field === 'password' ? 'password' : 'text'}
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={p[side][field]}
+                              onChange={(e) =>
+                                edit(index, { [side]: { ...p[side], [field]: e.target.value } })
+                              }
+                            />
+                          </label>
+                        ))}
+                        <div className="columns">
+                          <label>
+                            Port
+                            <input
+                              aria-label={`${p.id} ${side} port`}
+                              type="number"
+                              value={p[side].port}
+                              onChange={(e) =>
+                                edit(index, {
+                                  [side]: { ...p[side], port: Number(e.target.value) },
+                                })
+                              }
+                            />
+                          </label>
+                          <label>
+                            TLS mode
+                            <select
+                              value={p[side].tlsMode}
+                              onChange={(e) =>
+                                edit(index, {
+                                  [side]: {
+                                    ...p[side],
+                                    tlsMode: e.target.value as Endpoint['tlsMode'],
+                                  },
+                                })
+                              }
+                            >
+                              <option value="implicit">Implicit TLS</option>
+                              <option value="starttls">Mandatory STARTTLS</option>
+                            </select>
+                          </label>
+                        </div>
+                        <label>
+                          Custom CA file (optional, local path)
+                          <input
+                            value={p[side].caFile ?? ''}
+                            onChange={(e) =>
+                              edit(index, {
+                                [side]: { ...p[side], caFile: e.target.value || undefined },
+                              })
+                            }
+                          />
+                        </label>
+                      </div>
+                    ))}
+                  </div>
+                </article>
+              ))}
+              <div className="row">
+                {!importMode && (
                   <button
                     className="secondary"
                     onClick={() => {
-                      setPairs(pairs.filter((_, i) => i !== index));
-                      setOverrideDrafts({});
-                      setExclusionDrafts({});
+                      setPairs([...pairs, pair(pairs.length + 1)]);
                       setReady(false);
                     }}
                   >
-                    Remove pair
+                    Add mailbox pair
                   </button>
                 )}
+                <label>
+                  Message ceiling (MiB)
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={limit}
+                    onChange={(e) => {
+                      setLimit(Number(e.target.value));
+                      setReady(false);
+                    }}
+                  />
+                </label>
+                <label>
+                  Memory allowance (MiB)
+                  <input
+                    type="number"
+                    min="256"
+                    value={budget}
+                    onChange={(e) => {
+                      setBudget(Number(e.target.value));
+                      setReady(false);
+                    }}
+                  />
+                </label>
+                <label>
+                  Inventory occurrence ceiling
+                  <input
+                    type="number"
+                    min="1"
+                    max="100000"
+                    value={maxOccurrences}
+                    onChange={(e) => {
+                      setMaxOccurrences(Number(e.target.value));
+                      setReady(false);
+                      setConfirm(false);
+                    }}
+                  />
+                </label>
               </div>
-              <div className="columns">
-                {(['source', 'destination'] as const).map((side) => (
-                  <div key={side}>
-                    <h3>{side === 'source' ? 'Source · old host' : 'Destination · new host'}</h3>
-                    {(['host', 'username', 'password'] as const).map((field) => (
-                      <label key={field}>
-                        {field === 'host'
-                          ? 'IMAP hostname'
-                          : field === 'username'
-                            ? 'Username'
-                            : 'Password / app password'}
-                        <input
-                          aria-label={`${p.id} ${side} ${field}`}
-                          type={field === 'password' ? 'password' : 'text'}
-                          autoComplete="off"
-                          spellCheck={false}
-                          value={p[side][field]}
-                          onChange={(e) =>
-                            edit(index, { [side]: { ...p[side], [field]: e.target.value } })
-                          }
-                        />
-                      </label>
-                    ))}
-                    <div className="columns">
-                      <label>
-                        Port
-                        <input
-                          aria-label={`${p.id} ${side} port`}
-                          type="number"
-                          value={p[side].port}
-                          onChange={(e) =>
-                            edit(index, { [side]: { ...p[side], port: Number(e.target.value) } })
-                          }
-                        />
-                      </label>
-                      <label>
-                        TLS mode
-                        <select
-                          value={p[side].tlsMode}
-                          onChange={(e) =>
-                            edit(index, {
-                              [side]: {
-                                ...p[side],
-                                tlsMode: e.target.value as Endpoint['tlsMode'],
-                              },
-                            })
-                          }
-                        >
-                          <option value="implicit">Implicit TLS</option>
-                          <option value="starttls">Mandatory STARTTLS</option>
-                        </select>
-                      </label>
-                    </div>
+              <button
+                disabled={importMode && !archive}
+                onClick={() =>
+                  void perform(async () => {
+                    invalidatePlan();
+                    const result = await api<{
+                      ready: boolean;
+                      results: typeof tests;
+                      migrationId?: string;
+                      recordedMigrationId?: string;
+                    }>('test', {
+                      mailboxes: pairs,
+                      maxMessageMiB: limit,
+                      memoryBudgetMiB: budget,
+                      maxOccurrences,
+                    });
+                    setTests(result.results);
+                    setReady(result.ready);
+                    setSession({
+                      running: false,
+                      progress: [],
+                      migrationId: result.migrationId,
+                      recordedMigrationId: result.recordedMigrationId,
+                    });
+                    setMigration(result.migrationId ?? '');
+                    setConfirm(false);
+                  })
+                }
+              >
+                {importMode ? 'Validate archive and test destination' : 'Test both connections'}
+              </button>
+            </fieldset>
+            <div aria-live="polite">
+              {tests.map((r) => (
+                <p key={r.mailbox + r.side} className={r.ok ? 'success' : 'error'}>
+                  {r.mailbox} · {r.side}:{' '}
+                  {r.ok
+                    ? importMode && r.side === 'source'
+                      ? 'Archive manifest and folder access passed'
+                      : 'TLS, authentication and folder access passed'
+                    : r.error}
+                </p>
+              ))}
+            </div>
+          </section>
+          <section>
+            <h2>2. Review the migration plan</h2>
+            <p>
+              Discovery is read-only. Existing destination mail will be preserved. New source
+              occurrences are copied even if matching mail already exists.
+            </p>
+            <div className="row">
+              <label>
+                Pilot message limit (blank = all)
+                <input
+                  type="number"
+                  min="1"
+                  value={pilot}
+                  disabled={disabled}
+                  onChange={(e) => {
+                    setPilot(e.target.value);
+                    scheduleRebuild();
+                  }}
+                />
+              </label>
+              <label>
+                Existing migration ID (resume / catch-up)
+                <input
+                  value={migration}
+                  disabled={disabled}
+                  onChange={(e) => {
+                    setMigration(e.target.value);
+                    scheduleRebuild();
+                  }}
+                />
+              </label>
+            </div>
+            <fieldset disabled={!ready || disabled}>
+              <legend>Folder policy</legend>
+              <p>
+                Discover folders first, then use the Include checkboxes below. Unchecking a folder
+                adds its exact name to exclusions. Changes automatically update the plan from the
+                discovery snapshot without contacting mail servers. Review the updated plan before
+                confirming.
+              </p>
+              {pairs.map((p, index) => (
+                <div key={index}>
+                  <details open>
+                    <summary>Folder policy · {p.id}</summary>
                     <label>
-                      Custom CA file (optional, local path)
+                      Exclude exact folder names (one per line)
+                      <textarea
+                        aria-label={`${p.id} excluded folders`}
+                        value={exclusionDrafts[index] ?? p.folders.exclude.join('\n')}
+                        onChange={(e) => {
+                          setExclusionDrafts((d) => ({ ...d, [index]: e.target.value }));
+                          editPolicy(index, {
+                            folders: {
+                              ...p.folders,
+                              exclude: e.target.value.split('\n').filter(Boolean),
+                            },
+                          });
+                        }}
+                      />
+                    </label>
+                    <label>
+                      Folder overrides (JSON object)
+                      <textarea
+                        aria-label={`${p.id} folder overrides`}
+                        value={overrideDrafts[index] ?? JSON.stringify(p.folders.overrides)}
+                        onChange={(e) => {
+                          setOverrideDrafts((d) => ({ ...d, [index]: e.target.value }));
+                          scheduleRebuild();
+                          setConfirm(false);
+                        }}
+                        onBlur={(e) => {
+                          try {
+                            const overrides = JSON.parse(e.target.value) as Record<string, string>;
+                            if (
+                              Array.isArray(overrides) ||
+                              typeof overrides !== 'object' ||
+                              overrides === null ||
+                              Object.values(overrides).some((v) => typeof v !== 'string')
+                            )
+                              throw Error();
+                            editPolicy(index, { folders: { ...p.folders, overrides } });
+                          } catch {
+                            setError(
+                              'Folder overrides must be a JSON object of source names to destination names.',
+                            );
+                          }
+                        }}
+                      />
+                    </label>
+                    <label className="check">
                       <input
-                        value={p[side].caFile ?? ''}
+                        type="checkbox"
+                        checked={p.folders.labelStrategy === 'explicit-folders'}
                         onChange={(e) =>
-                          edit(index, {
-                            [side]: { ...p[side], caFile: e.target.value || undefined },
+                          editPolicy(index, {
+                            folders: {
+                              ...p.folders,
+                              labelStrategy: e.target.checked ? 'explicit-folders' : 'unresolved',
+                            },
                           })
                         }
                       />
+                      I reviewed virtual / label folders and accept the selected physical-copy
+                      scope.
                     </label>
-                  </div>
-                ))}
-              </div>
-            </article>
-          ))}
-          <div className="row">
-            <button
-              className="secondary"
-              onClick={() => {
-                setPairs([...pairs, pair(pairs.length + 1)]);
-                setReady(false);
-              }}
-            >
-              Add mailbox pair
-            </button>
-            <label>
-              Message ceiling (MiB)
-              <input
-                type="number"
-                min="1"
-                max="100"
-                value={limit}
-                onChange={(e) => {
-                  setLimit(Number(e.target.value));
-                  setReady(false);
-                }}
-              />
-            </label>
-            <label>
-              Memory allowance (MiB)
-              <input
-                type="number"
-                min="256"
-                value={budget}
-                onChange={(e) => {
-                  setBudget(Number(e.target.value));
-                  setReady(false);
-                }}
-              />
-            </label>
-            <label>
-              Inventory occurrence ceiling
-              <input
-                type="number"
-                min="1"
-                max="100000"
-                value={maxOccurrences}
-                onChange={(e) => {
-                  setMaxOccurrences(Number(e.target.value));
-                  setReady(false);
-                  setConfirm(false);
-                }}
-              />
-            </label>
-          </div>
-          <button
-            onClick={() =>
-              void perform(async () => {
-                invalidatePlan();
-                const result = await api<{
-                  ready: boolean;
-                  results: typeof tests;
-                  migrationId?: string;
-                  recordedMigrationId?: string;
-                }>('test', {
-                  mailboxes: pairs,
-                  maxMessageMiB: limit,
-                  memoryBudgetMiB: budget,
-                  maxOccurrences,
-                });
-                setTests(result.results);
-                setReady(result.ready);
-                setSession({
-                  running: false,
-                  progress: [],
-                  migrationId: result.migrationId,
-                  recordedMigrationId: result.recordedMigrationId,
-                });
-                setMigration(result.migrationId ?? '');
-                setConfirm(false);
-              })
-            }
-          >
-            Test both connections
-          </button>
-        </fieldset>
-        <div aria-live="polite">
-          {tests.map((r) => (
-            <p key={r.mailbox + r.side} className={r.ok ? 'success' : 'error'}>
-              {r.mailbox} · {r.side}:{' '}
-              {r.ok ? 'TLS, authentication and folder access passed' : r.error}
-            </p>
-          ))}
-        </div>
-      </section>
-      <section>
-        <h2>2. Review the migration plan</h2>
-        <p>
-          Discovery is read-only. Existing destination mail will be preserved. New source
-          occurrences are copied even if matching mail already exists.
-        </p>
-        <div className="row">
-          <label>
-            Pilot message limit (blank = all)
-            <input
-              type="number"
-              min="1"
-              value={pilot}
-              disabled={disabled}
-              onChange={(e) => {
-                setPilot(e.target.value);
-                scheduleRebuild();
-              }}
-            />
-          </label>
-          <label>
-            Existing migration ID (resume / catch-up)
-            <input
-              value={migration}
-              disabled={disabled}
-              onChange={(e) => {
-                setMigration(e.target.value);
-                scheduleRebuild();
-              }}
-            />
-          </label>
-        </div>
-        <fieldset disabled={!ready || disabled}>
-          <legend>Folder policy</legend>
-          <p>
-            Discover folders first, then use the Include checkboxes below. Unchecking a folder adds
-            its exact name to exclusions. Changes automatically update the plan from the discovery
-            snapshot without contacting mail servers. Review the updated plan before confirming.
-          </p>
-          {pairs.map((p, index) => (
-            <div key={index}>
-              <details open>
-                <summary>Folder policy · {p.id}</summary>
-                <label>
-                  Exclude exact folder names (one per line)
-                  <textarea
-                    aria-label={`${p.id} excluded folders`}
-                    value={exclusionDrafts[index] ?? p.folders.exclude.join('\n')}
-                    onChange={(e) => {
-                      setExclusionDrafts((d) => ({ ...d, [index]: e.target.value }));
-                      editPolicy(index, {
-                        folders: {
-                          ...p.folders,
-                          exclude: e.target.value.split('\n').filter(Boolean),
-                        },
-                      });
-                    }}
-                  />
-                </label>
-                <label>
-                  Folder overrides (JSON object)
-                  <textarea
-                    aria-label={`${p.id} folder overrides`}
-                    value={overrideDrafts[index] ?? JSON.stringify(p.folders.overrides)}
-                    onChange={(e) => {
-                      setOverrideDrafts((d) => ({ ...d, [index]: e.target.value }));
-                      scheduleRebuild();
-                      setConfirm(false);
-                    }}
-                    onBlur={(e) => {
-                      try {
-                        const overrides = JSON.parse(e.target.value) as Record<string, string>;
-                        if (
-                          Array.isArray(overrides) ||
-                          typeof overrides !== 'object' ||
-                          overrides === null ||
-                          Object.values(overrides).some((v) => typeof v !== 'string')
-                        )
-                          throw Error();
-                        editPolicy(index, { folders: { ...p.folders, overrides } });
-                      } catch {
-                        setError(
-                          'Folder overrides must be a JSON object of source names to destination names.',
-                        );
-                      }
-                    }}
-                  />
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={p.folders.labelStrategy === 'explicit-folders'}
-                    onChange={(e) =>
-                      editPolicy(index, {
-                        folders: {
-                          ...p.folders,
-                          labelStrategy: e.target.checked ? 'explicit-folders' : 'unresolved',
-                        },
-                      })
-                    }
-                  />
-                  I reviewed virtual / label folders and accept the selected physical-copy scope.
-                </label>
-              </details>
-            </div>
-          ))}
-        </fieldset>
-        {planDirty && plan && (
-          <p role="status" className="warning">
-            {rebuilding
-              ? 'Updating plan from discovery snapshot…'
-              : 'The plan needs updating before approval. Correct any policy errors, or refresh discovery if no snapshot is available.'}
-          </p>
-        )}
-        <div className="row">
-          <button
-            disabled={!ready || disabled || rebuilding}
-            onClick={() =>
-              void perform(async () => {
-                invalidatePlan();
-                setStartingPlan(true);
-                setConfirm(false);
-                setDiscoveryError('');
-                setSession((s) => ({
-                  ...s,
-                  plan: undefined,
-                  discovery: undefined,
-                  snapshot: undefined,
-                }));
-                try {
-                  const result = await api<{
-                    discovery: Discovery;
-                    migrationId: string;
-                    recordedMigrationId?: string;
-                  }>('plan', {
-                    ...(pilot ? { pilot: Number(pilot) } : {}),
-                    ...(migration ? { migration } : {}),
-                    folderPolicies: folderPolicies(),
-                  });
-                  pendingDiscovery.current = result.discovery.startedAt;
-                  setMigration(result.migrationId);
-                  setSession((s) => ({
-                    ...s,
-                    discovery: result.discovery,
-                    migrationId: result.migrationId,
-                    recordedMigrationId: result.recordedMigrationId,
-                    plan: undefined,
-                    report: undefined,
-                  }));
-                } catch (e) {
-                  setDiscoveryError(
-                    e instanceof SessionExpired
-                      ? 'Reconnect to the local app before retrying discovery.'
-                      : (e as Error).message,
-                  );
-                  throw e;
-                } finally {
-                  setStartingPlan(false);
-                }
-              })
-            }
-          >
-            {discovering
-              ? 'Discovering folders…'
-              : session.snapshot
-                ? 'Refresh discovery'
-                : 'Discover folders & build plan'}
-          </button>
-          <button
-            className="secondary"
-            disabled={
-              !ready ||
-              !migration ||
-              migration !== session.recordedMigrationId ||
-              disabled ||
-              rebuilding
-            }
-            onClick={() =>
-              void perform(async () => {
-                invalidatePlan();
-                const loaded = await api<{ plan: Plan; report: Report }>('load', {
-                  migration,
-                  folderPolicies: folderPolicies(),
-                });
-                setSession((s) => ({ ...s, ...loaded, snapshot: undefined }));
-                setMigration(loaded.plan.migration);
-                setSession((s) => ({
-                  ...s,
-                  migrationId: loaded.plan.migration,
-                  recordedMigrationId: loaded.plan.migration,
-                }));
-                setPilot(loaded.plan.scope.pilot?.toString() ?? '');
-                setConfirm(false);
-                pendingDiscovery.current = undefined;
-                setPlanDirty(false);
-              })
-            }
-          >
-            Load saved migration
-          </button>
-        </div>
-        {discoveryError && (
-          <p role="alert" className="error">
-            {discoveryError}
-          </p>
-        )}
-        {(startingPlan || session.discovery) && (
-          <DiscoveryStatus
-            value={session.discovery}
-            starting={startingPlan}
-            cancelDisabled={busy || needsSession}
-            onCancel={() =>
-              void perform(async () => {
-                await api('cancel', {});
-                setSession((s) => ({
-                  ...s,
-                  discovery:
-                    s.discovery?.status === 'running'
-                      ? { ...s.discovery, phase: 'cancelling' }
-                      : s.discovery,
-                }));
-              })
-            }
-          />
-        )}
-        {session.snapshot && (
-          <p role="status">
-            Discovery snapshot: {new Date(session.snapshot.created).toLocaleString()}. Selection
-            changes use this snapshot. Use Refresh discovery to include new mail or scan a
-            previously excluded folder.
-          </p>
-        )}
-        {plan && (
-          <>
-            <p className="mono">
-              Migration: {plan.migration}
-              <br />
-              Plan: {plan.id}
-            </p>
-            {plan.scope.pilot && (
-              <p className="warning">
-                Pilot scope: at most {plan.scope.pilot} messages. This is not complete mailbox
-                coverage.
+                  </details>
+                </div>
+              ))}
+            </fieldset>
+            {planDirty && plan && (
+              <p role="status" className="warning">
+                {rebuilding
+                  ? 'Updating plan from discovery snapshot…'
+                  : 'The plan needs updating before approval. Correct any policy errors, or refresh discovery if no snapshot is available.'}
               </p>
             )}
-            {plan.blockers.map((b) => (
-              <p className="error" key={b}>
-                {b.includes(':refresh_discovery_required:')
-                  ? `${b.split(':refresh_discovery_required:')[0]}: ${b.split(':refresh_discovery_required:')[1]} was not inventoried. Refresh discovery to include this folder, or uncheck it.`
-                  : b}
+            <div className="row">
+              <button
+                disabled={!ready || disabled || rebuilding}
+                onClick={() =>
+                  void perform(async () => {
+                    invalidatePlan();
+                    setStartingPlan(true);
+                    setConfirm(false);
+                    setDiscoveryError('');
+                    setSession((s) => ({
+                      ...s,
+                      plan: undefined,
+                      discovery: undefined,
+                      snapshot: undefined,
+                    }));
+                    try {
+                      const result = await api<{
+                        discovery: Discovery;
+                        migrationId: string;
+                        recordedMigrationId?: string;
+                      }>('plan', {
+                        ...(pilot ? { pilot: Number(pilot) } : {}),
+                        ...(migration ? { migration } : {}),
+                        folderPolicies: folderPolicies(),
+                      });
+                      pendingDiscovery.current = result.discovery.startedAt;
+                      setMigration(result.migrationId);
+                      setSession((s) => ({
+                        ...s,
+                        discovery: result.discovery,
+                        migrationId: result.migrationId,
+                        recordedMigrationId: result.recordedMigrationId,
+                        plan: undefined,
+                        report: undefined,
+                      }));
+                    } catch (e) {
+                      setDiscoveryError(
+                        e instanceof SessionExpired
+                          ? 'Reconnect to the local app before retrying discovery.'
+                          : (e as Error).message,
+                      );
+                      throw e;
+                    } finally {
+                      setStartingPlan(false);
+                    }
+                  })
+                }
+              >
+                {discovering
+                  ? 'Discovering folders…'
+                  : session.snapshot
+                    ? 'Refresh discovery'
+                    : 'Discover folders & build plan'}
+              </button>
+              <button
+                className="secondary"
+                disabled={
+                  !ready ||
+                  !migration ||
+                  migration !== session.recordedMigrationId ||
+                  disabled ||
+                  rebuilding
+                }
+                onClick={() =>
+                  void perform(async () => {
+                    invalidatePlan();
+                    const loaded = await api<{ plan: Plan; report: Report }>('load', {
+                      migration,
+                      folderPolicies: folderPolicies(),
+                    });
+                    setSession((s) => ({ ...s, ...loaded, snapshot: undefined }));
+                    setMigration(loaded.plan.migration);
+                    setSession((s) => ({
+                      ...s,
+                      migrationId: loaded.plan.migration,
+                      recordedMigrationId: loaded.plan.migration,
+                    }));
+                    setPilot(loaded.plan.scope.pilot?.toString() ?? '');
+                    setConfirm(false);
+                    pendingDiscovery.current = undefined;
+                    setPlanDirty(false);
+                  })
+                }
+              >
+                Load saved migration
+              </button>
+            </div>
+            {discoveryError && (
+              <p role="alert" className="error">
+                {discoveryError}
               </p>
-            ))}
-            {plan.pairs.map((p) => (
-              <div key={p.id}>
-                <h3>{p.id}</h3>
-                <p>
-                  {p.source.username} @ {p.source.host}:{p.source.port} → {p.destination.username} @{' '}
-                  {p.destination.host}:{p.destination.port}
+            )}
+            {(startingPlan || session.discovery) && (
+              <DiscoveryStatus
+                value={session.discovery}
+                starting={startingPlan}
+                cancelDisabled={busy || needsSession}
+                onCancel={() =>
+                  void perform(async () => {
+                    await api('cancel', {});
+                    setSession((s) => ({
+                      ...s,
+                      discovery:
+                        s.discovery?.status === 'running'
+                          ? { ...s.discovery, phase: 'cancelling' }
+                          : s.discovery,
+                    }));
+                  })
+                }
+              />
+            )}
+            {session.snapshot && (
+              <p role="status">
+                Discovery snapshot: {new Date(session.snapshot.created).toLocaleString()}. Selection
+                changes use this snapshot. Use Refresh discovery to include new mail or scan a
+                previously excluded folder.
+              </p>
+            )}
+            {plan && (
+              <>
+                <p className="mono">
+                  Migration: {plan.migration}
+                  <br />
+                  Plan: {plan.id}
                 </p>
+                {plan.scope.pilot && (
+                  <p className="warning">
+                    Pilot scope: at most {plan.scope.pilot} messages. This is not complete mailbox
+                    coverage.
+                  </p>
+                )}
+                {plan.blockers.map((b) => (
+                  <p className="error" key={b}>
+                    {b.includes(':refresh_discovery_required:')
+                      ? `${b.split(':refresh_discovery_required:')[0]}: ${b.split(':refresh_discovery_required:')[1]} was not inventoried. Refresh discovery to include this folder, or uncheck it.`
+                      : b}
+                  </p>
+                ))}
+                {plan.pairs.map((p) => (
+                  <div key={p.id}>
+                    <h3>{p.id}</h3>
+                    <p>
+                      {importMode && archive
+                        ? `Local archive: ${archive.source.username} @ ${archive.source.host}`
+                        : `${p.source.username} @ ${p.source.host}:${p.source.port}`}{' '}
+                      → {p.destination.username} @ {p.destination.host}:{p.destination.port}
+                    </p>
+                    <p>
+                      Destination APPEND limit:{' '}
+                      {p.appendLimit === null ? 'unknown' : `${p.appendLimit} bytes`}. Quota:{' '}
+                      <code>{JSON.stringify(p.quota)}</code>
+                    </p>
+                    <div className="table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Include</th>
+                            <th>Source folder</th>
+                            <th>Destination</th>
+                            <th>Observed</th>
+                            <th>Selected</th>
+                            <th>Estimated bytes</th>
+                            <th>Over size limit</th>
+                            <th>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {p.mappings.map((m, i) => {
+                            const index = pairs.findIndex((pair) => pair.id === p.id);
+                            const draft = pairs[index];
+                            const fixedExclusion =
+                              !m.source.selectable ||
+                              (m.excluded !== undefined && m.excluded !== 'explicit_exclusion');
+                            const included =
+                              !!draft &&
+                              !fixedExclusion &&
+                              !draft.folders.exclude.includes(m.source.path);
+                            return (
+                              <tr key={i}>
+                                <td>
+                                  <input
+                                    type="checkbox"
+                                    aria-label={`Include ${p.id} ${m.source.path}`}
+                                    checked={included}
+                                    disabled={!ready || disabled || fixedExclusion || !draft}
+                                    onChange={(e) => {
+                                      if (!draft) return;
+                                      const exclude = draft.folders.exclude.filter(
+                                        (name) => name !== m.source.path,
+                                      );
+                                      if (!e.target.checked) exclude.push(m.source.path);
+                                      setExclusionDrafts((d) => ({
+                                        ...d,
+                                        [index]: exclude.join('\n'),
+                                      }));
+                                      editPolicy(index, { folders: { ...draft.folders, exclude } });
+                                    }}
+                                  />
+                                </td>
+                                <td>{m.source.path}</td>
+                                <td>{m.target}</td>
+                                <td>{m.source.count ?? 'unknown'}</td>
+                                <td>{planDirty ? 'Rebuild required' : m.messages.length}</td>
+                                <td>{planDirty ? '—' : m.bytes.toLocaleString()}</td>
+                                <td>{planDirty ? '—' : m.oversized}</td>
+                                <td>
+                                  {planDirty
+                                    ? fixedExclusion
+                                      ? m.excluded
+                                      : included
+                                        ? 'Include after rebuild'
+                                        : 'Exclude after rebuild'
+                                    : (m.excluded ??
+                                      (m.existing
+                                        ? 'Append; preserve existing'
+                                        : 'Create and append'))}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))}
+                <button
+                  className="secondary"
+                  disabled={disabled || planDirty || !ready}
+                  onClick={() =>
+                    void perform(() => download('plan/download', 'migration-plan.json'))
+                  }
+                >
+                  Download private plan
+                </button>
+              </>
+            )}
+          </section>
+          <section>
+            <h2>3. Confirm the copy</h2>
+            <p>
+              Read-only tests cannot establish that every future write will succeed.{' '}
+              {importMode
+                ? 'Confirm the destination account and selected archive folders. The local archive remains unchanged.'
+                : 'Confirm that these are independent source and destination accounts, even if hostnames differ.'}
+            </p>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={confirm}
+                disabled={!ready || !plan || planDirty || disabled}
+                onChange={(e) => setConfirm(e.target.checked)}
+              />
+              I reviewed this plan’s accounts, folders and scope. I approve creating required
+              destination folders and copying the selected messages.
+            </label>
+            <div className="row">
+              <button
+                disabled={
+                  !ready || !plan || planDirty || !confirm || !!plan.blockers.length || disabled
+                }
+                onClick={() =>
+                  void perform(async () => {
+                    await api('run', {
+                      hash: plan!.hash,
+                      confirm: true,
+                      mode: resuming ? 'resume' : 'run',
+                    });
+                    setSession((s) => ({ ...s, running: true }));
+                    setConfirm(false);
+                  })
+                }
+              >
+                {resuming ? 'Resume / run catch-up' : 'Start migration'}
+              </button>
+              <button
+                className="secondary"
+                disabled={!ready || !plan || planDirty || disabled}
+                onClick={() =>
+                  void perform(async () => {
+                    await api('run', { hash: plan!.hash, confirm: true, mode: 'verify' });
+                    setSession((s) => ({ ...s, running: true }));
+                  })
+                }
+              >
+                Reverify destination (read-only)
+              </button>
+              {session.running && (
+                <button
+                  className="secondary"
+                  onClick={() =>
+                    void perform(async () => {
+                      await api('cancel', {});
+                    })
+                  }
+                >
+                  Stop after current operation
+                </button>
+              )}
+            </div>
+          </section>
+          <section>
+            <h2>4. Progress &amp; evidence</h2>
+            <p aria-live="polite">
+              {discovering
+                ? 'Discovering folders. See progress in the plan review above.'
+                : session.running
+                  ? 'Migration running. Keep the PowerShell backend open.'
+                  : busy
+                    ? 'Working…'
+                    : 'Ready.'}
+            </p>
+            <ul className="progress">
+              {session.progress.slice(-8).map((p, i) => (
+                <li key={i}>
+                  {p.mailbox} · {p.item.slice(0, 12)} · {p.state}
+                </li>
+              ))}
+            </ul>
+            {report && (
+              <>
+                <h3>{report.status.replaceAll('_', ' ')}</h3>
                 <p>
-                  Destination APPEND limit:{' '}
-                  {p.appendLimit === null ? 'unknown' : `${p.appendLimit} bytes`}. Quota:{' '}
-                  <code>{JSON.stringify(p.quota)}</code>
+                  {report.occurrences} recorded occurrences · {report.unresolved} unresolved ·{' '}
+                  {report.verifiedBytes.toLocaleString()} verified bytes
                 </p>
+                <p className="mono">{report.migration}</p>
+                <button
+                  className="secondary"
+                  onClick={() => void perform(() => download('report', 'migration-report.json'))}
+                >
+                  Download private report
+                </button>
                 <div className="table-wrap">
                   <table>
                     <thead>
                       <tr>
-                        <th>Include</th>
-                        <th>Source folder</th>
-                        <th>Destination</th>
-                        <th>Observed</th>
-                        <th>Selected</th>
-                        <th>Estimated bytes</th>
-                        <th>Over size limit</th>
-                        <th>Action</th>
+                        <th>Mailbox / folder</th>
+                        <th>Item</th>
+                        <th>Outcome</th>
+                        <th>Evidence / resolution</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {p.mappings.map((m, i) => {
-                        const index = pairs.findIndex((pair) => pair.id === p.id);
-                        const draft = pairs[index];
-                        const fixedExclusion =
-                          !m.source.selectable ||
-                          (m.excluded !== undefined && m.excluded !== 'explicit_exclusion');
-                        const included =
-                          !!draft &&
-                          !fixedExclusion &&
-                          !draft.folders.exclude.includes(m.source.path);
-                        return (
-                          <tr key={i}>
+                      {report.items
+                        .filter((i) => i.state !== 'verified' || i.deviations.length)
+                        .map((i) => (
+                          <tr key={i.id}>
                             <td>
-                              <input
-                                type="checkbox"
-                                aria-label={`Include ${p.id} ${m.source.path}`}
-                                checked={included}
-                                disabled={!ready || disabled || fixedExclusion || !draft}
-                                onChange={(e) => {
-                                  if (!draft) return;
-                                  const exclude = draft.folders.exclude.filter(
-                                    (name) => name !== m.source.path,
-                                  );
-                                  if (!e.target.checked) exclude.push(m.source.path);
-                                  setExclusionDrafts((d) => ({
-                                    ...d,
-                                    [index]: exclude.join('\n'),
-                                  }));
-                                  editPolicy(index, { folders: { ...draft.folders, exclude } });
-                                }}
+                              {i.mailbox}
+                              <br />
+                              {i.folder}
+                            </td>
+                            <td className="mono">{i.id.slice(0, 12)}</td>
+                            <td>
+                              {i.state}
+                              <br />
+                              {i.category}
+                              <br />
+                              {i.deviations.join(', ')}
+                            </td>
+                            <td>
+                              <Resolution
+                                key={`${i.id}:${i.state}:${i.destination?.uid ?? ''}`}
+                                item={i}
+                                candidates={i.candidates?.map((c) => c.uid) ?? []}
+                                disabled={disabled}
+                                onResolve={(action) =>
+                                  void perform(async () => {
+                                    const r = await api<Report>('resolve', {
+                                      migration: report.migration,
+                                      item: i.id,
+                                      ...action,
+                                      ...(action.appendAgain ? { acceptDuplicateRisk: true } : {}),
+                                    });
+                                    setSession((s) => ({ ...s, report: r }));
+                                    setConfirm(false);
+                                  })
+                                }
                               />
                             </td>
-                            <td>{m.source.path}</td>
-                            <td>{m.target}</td>
-                            <td>{m.source.count ?? 'unknown'}</td>
-                            <td>{planDirty ? 'Rebuild required' : m.messages.length}</td>
-                            <td>{planDirty ? '—' : m.bytes.toLocaleString()}</td>
-                            <td>{planDirty ? '—' : m.oversized}</td>
-                            <td>
-                              {planDirty
-                                ? fixedExclusion
-                                  ? m.excluded
-                                  : included
-                                    ? 'Include after rebuild'
-                                    : 'Exclude after rebuild'
-                                : (m.excluded ??
-                                  (m.existing ? 'Append; preserve existing' : 'Create and append'))}
-                            </td>
                           </tr>
-                        );
-                      })}
+                        ))}
                     </tbody>
                   </table>
                 </div>
-              </div>
-            ))}
-            <button
-              className="secondary"
-              disabled={disabled || planDirty || !ready}
-              onClick={() => void perform(() => download('plan/download', 'migration-plan.json'))}
-            >
-              Download private plan
-            </button>
-          </>
-        )}
-      </section>
-      <section>
-        <h2>3. Confirm the copy</h2>
-        <p>
-          Read-only tests cannot establish that every future write will succeed. Confirm that these
-          are independent source and destination accounts, even if hostnames differ.
-        </p>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={confirm}
-            disabled={!ready || !plan || planDirty || disabled}
-            onChange={(e) => setConfirm(e.target.checked)}
-          />
-          I reviewed this plan’s accounts, folders and scope. I approve creating required
-          destination folders and copying the selected messages.
-        </label>
-        <div className="row">
-          <button
-            disabled={
-              !ready || !plan || planDirty || !confirm || !!plan.blockers.length || disabled
-            }
-            onClick={() =>
-              void perform(async () => {
-                await api('run', {
-                  hash: plan!.hash,
-                  confirm: true,
-                  mode: resuming ? 'resume' : 'run',
-                });
-                setSession((s) => ({ ...s, running: true }));
-                setConfirm(false);
-              })
-            }
-          >
-            {resuming ? 'Resume / run catch-up' : 'Start migration'}
-          </button>
-          <button
-            className="secondary"
-            disabled={!ready || !plan || planDirty || disabled}
-            onClick={() =>
-              void perform(async () => {
-                await api('run', { hash: plan!.hash, confirm: true, mode: 'verify' });
-                setSession((s) => ({ ...s, running: true }));
-              })
-            }
-          >
-            Reverify destination (read-only)
-          </button>
-          {session.running && (
-            <button
-              className="secondary"
-              onClick={() =>
-                void perform(async () => {
-                  await api('cancel', {});
-                })
-              }
-            >
-              Stop after current operation
-            </button>
-          )}
-        </div>
-      </section>
-      <section>
-        <h2>4. Progress &amp; evidence</h2>
-        <p aria-live="polite">
-          {discovering
-            ? 'Discovering folders. See progress in the plan review above.'
-            : session.running
-              ? 'Migration running. Keep the PowerShell backend open.'
-              : busy
-                ? 'Working…'
-                : 'Ready.'}
-        </p>
-        <ul className="progress">
-          {session.progress.slice(-8).map((p, i) => (
-            <li key={i}>
-              {p.mailbox} · {p.item.slice(0, 12)} · {p.state}
-            </li>
-          ))}
-        </ul>
-        {report && (
-          <>
-            <h3>{report.status.replaceAll('_', ' ')}</h3>
-            <p>
-              {report.occurrences} recorded occurrences · {report.unresolved} unresolved ·{' '}
-              {report.verifiedBytes.toLocaleString()} verified bytes
-            </p>
-            <p className="mono">{report.migration}</p>
-            <button
-              className="secondary"
-              onClick={() => void perform(() => download('report', 'migration-report.json'))}
-            >
-              Download private report
-            </button>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Mailbox / folder</th>
-                    <th>Item</th>
-                    <th>Outcome</th>
-                    <th>Evidence / resolution</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {report.items
-                    .filter((i) => i.state !== 'verified' || i.deviations.length)
-                    .map((i) => (
-                      <tr key={i.id}>
-                        <td>
-                          {i.mailbox}
-                          <br />
-                          {i.folder}
-                        </td>
-                        <td className="mono">{i.id.slice(0, 12)}</td>
-                        <td>
-                          {i.state}
-                          <br />
-                          {i.category}
-                          <br />
-                          {i.deviations.join(', ')}
-                        </td>
-                        <td>
-                          <Resolution
-                            key={`${i.id}:${i.state}:${i.destination?.uid ?? ''}`}
-                            item={i}
-                            candidates={i.candidates?.map((c) => c.uid) ?? []}
-                            disabled={disabled}
-                            onResolve={(action) =>
-                              void perform(async () => {
-                                const r = await api<Report>('resolve', {
-                                  migration: report.migration,
-                                  item: i.id,
-                                  ...action,
-                                  ...(action.appendAgain ? { acceptDuplicateRisk: true } : {}),
-                                });
-                                setSession((s) => ({ ...s, report: r }));
-                                setConfirm(false);
-                              })
-                            }
-                          />
-                        </td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-      </section>
+              </>
+            )}
+          </section>
+        </>
+      )}
       <footer>
         No source deletion · No SMTP · No telemetry · Full raw-content verification
         <br />
