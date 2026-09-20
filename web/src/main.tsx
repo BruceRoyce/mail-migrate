@@ -65,6 +65,8 @@ type Report = {
     folder: string;
     state: string;
     category?: string;
+    hash?: string;
+    destination?: { uid: string; validity: string };
     deviations: string[];
     candidates?: { uid: string }[];
   }[];
@@ -1068,20 +1070,20 @@ function App() {
                         </td>
                         <td>
                           <Resolution
-                            item={i.id}
+                            key={`${i.id}:${i.state}:${i.destination?.uid ?? ''}`}
+                            item={i}
                             candidates={i.candidates?.map((c) => c.uid) ?? []}
                             disabled={disabled}
-                            onResolve={(link, appendAgain) =>
+                            onResolve={(action) =>
                               void perform(async () => {
                                 const r = await api<Report>('resolve', {
                                   migration: report.migration,
                                   item: i.id,
-                                  ...(link ? { link } : {}),
-                                  ...(appendAgain
-                                    ? { appendAgain: true, acceptDuplicateRisk: true }
-                                    : {}),
+                                  ...action,
+                                  ...(action.appendAgain ? { acceptDuplicateRisk: true } : {}),
                                 });
                                 setSession((s) => ({ ...s, report: r }));
+                                setConfirm(false);
                               })
                             }
                           />
@@ -1224,42 +1226,88 @@ function Resolution({
   disabled,
   onResolve,
 }: {
-  item: string;
+  item: Report['items'][number];
   candidates: string[];
   disabled: boolean;
-  onResolve: (uid?: string, appendAgain?: boolean) => void;
+  onResolve: (action: { link?: string; appendAgain?: boolean; retryRead?: boolean }) => void;
 }) {
   const [uid, setUid] = useState(''),
     [risk, setRisk] = useState(false);
+  const canAppendAgain = item.state === 'ambiguous' && !item.destination;
+  const canRetryRead =
+    ['permanent_failure', 'source_missing'].includes(item.state) && !item.destination;
+  const canLink =
+    !!item.hash &&
+    item.category !== 'source_uidvalidity_changed' &&
+    [
+      'ambiguous',
+      'identity_changed',
+      'destination_missing',
+      'content_mismatch',
+      'appended_unverified',
+    ].includes(item.state);
+  const guidance =
+    item.category === 'source_uidvalidity_changed'
+      ? 'The source folder identity changed. This requires folder reconciliation before retrying.'
+      : ['discovered', 'prepared', 'retryable_failure', 'append_pending'].includes(item.state)
+        ? 'Review the current plan, confirm it again, and use Resume / run catch-up. Recovery uses the recorded write evidence.'
+        : item.state === 'verified'
+          ? 'Message content is verified. Reported metadata differences do not require another copy.'
+          : item.destination
+            ? 'A destination message is already linked. Use Reverify destination, or verify and link a corrected UID where available. Another append is not permitted.'
+            : 'Review the recorded outcome and correct its cause before choosing a recovery action.';
   return (
     <details>
       <summary>Review / resolve</summary>
-      <p>
-        Matching candidate UIDs: {candidates.join(', ') || 'none recorded'}. A match alone cannot
-        prove who created it.
-      </p>
-      <label>
-        Destination UID
-        <input
-          aria-label={`Destination UID ${item}`}
-          value={uid}
-          onChange={(e) => setUid(e.target.value)}
-        />
-      </label>
-      <button disabled={disabled || !uid} onClick={() => onResolve(uid)}>
-        Verify &amp; link UID
-      </button>
-      <label className="check">
-        <input type="checkbox" checked={risk} onChange={(e) => setRisk(e.target.checked)} />I accept
-        that another append may create a duplicate.
-      </label>
-      <button
-        className="secondary"
-        disabled={disabled || !risk}
-        onClick={() => onResolve(undefined, true)}
-      >
-        Permit a new append on resume
-      </button>
+      <p>{guidance}</p>
+      {canRetryRead && (
+        <>
+          <p>
+            After correcting the pre-copy failure, permit a retry. This changes only the local
+            ledger; copying still requires a reviewed, confirmed resume.
+          </p>
+          <button disabled={disabled} onClick={() => onResolve({ retryRead: true })}>
+            Permit retry after correcting failure
+          </button>
+        </>
+      )}
+      {canLink && (
+        <>
+          <p>
+            Matching candidate UIDs: {candidates.join(', ') || 'none recorded'}. A match alone
+            cannot prove who created it.
+          </p>
+          <label>
+            Destination UID
+            <input
+              aria-label={`Destination UID ${item.id}`}
+              value={uid}
+              onChange={(e) => setUid(e.target.value)}
+            />
+          </label>
+          <button
+            disabled={disabled || !/^\d+$/.test(uid)}
+            onClick={() => onResolve({ link: uid })}
+          >
+            Verify &amp; link UID
+          </button>
+        </>
+      )}
+      {canAppendAgain && (
+        <>
+          <label className="check">
+            <input type="checkbox" checked={risk} onChange={(e) => setRisk(e.target.checked)} />I
+            accept that another append may create a duplicate.
+          </label>
+          <button
+            className="secondary"
+            disabled={disabled || !risk}
+            onClick={() => onResolve({ appendAgain: true })}
+          >
+            Permit a new append on resume
+          </button>
+        </>
+      )}
     </details>
   );
 }

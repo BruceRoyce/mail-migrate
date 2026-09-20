@@ -418,3 +418,86 @@ test('inventory limit produces a visible discovery error with no partial plan to
   await expect(page.getByRole('button', { name: 'Start migration', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: 'Download private plan' })).toHaveCount(0);
 });
+
+test('recovery controls offer only actions supported by each recorded message state', async ({
+  page,
+}) => {
+  const { token } = JSON.parse(readFileSync('test/ui-session.json', 'utf8'));
+  const cases = [
+    { state: 'permanent_failure', folder: 'Pre-copy failure' },
+    { state: 'source_missing', folder: 'Missing source' },
+    { state: 'retryable_failure', folder: 'Retry on resume' },
+    { state: 'ambiguous', folder: 'Uncertain unlinked' },
+    { state: 'ambiguous', folder: 'Uncertain linked', destination: { uid: '7', validity: '1' } },
+    {
+      state: 'destination_missing',
+      folder: 'Missing destination',
+      destination: { uid: '8', validity: '1' },
+    },
+    {
+      state: 'identity_changed',
+      folder: 'Source identity changed',
+      category: 'source_uidvalidity_changed',
+    },
+  ];
+  const report = {
+    migration: '00000000-0000-4000-8000-000000000001',
+    status: 'incomplete',
+    unresolved: cases.length,
+    occurrences: cases.length,
+    verifiedBytes: 0,
+    counts: {},
+    items: cases.map((c, n) => ({
+      ...c,
+      id: String(n + 1).repeat(64),
+      mailbox: 'test',
+      hash: 'a'.repeat(64),
+      deviations: [],
+      candidates: [],
+    })),
+  };
+  let action: Record<string, unknown> | undefined;
+  await page.route('**/api/session', (route) =>
+    route.fulfill({ json: { running: false, progress: [], report } }),
+  );
+  await page.route('**/api/resolve', (route) => {
+    action = route.request().postDataJSON();
+    report.items[0]!.state = 'discovered';
+    return route.fulfill({ json: report });
+  });
+  await page.goto('/#' + token);
+  for (const c of cases) {
+    const row = page
+      .getByRole('row')
+      .filter({ has: page.locator('td:first-child').filter({ hasText: c.folder }) });
+    await row.getByText('Review / resolve', { exact: true }).click();
+    await expect(row.getByRole('button', { name: 'Permit a new append on resume' })).toHaveCount(
+      c.folder === 'Uncertain unlinked' ? 1 : 0,
+    );
+    await expect(
+      row.getByRole('button', { name: 'Permit retry after correcting failure' }),
+    ).toHaveCount(['permanent_failure', 'source_missing'].includes(c.state) ? 1 : 0);
+    if (c.state === 'identity_changed')
+      await expect(row.getByRole('button', { name: 'Verify & link UID' })).toHaveCount(0);
+  }
+  const ambiguous = page
+    .getByRole('row')
+    .filter({ has: page.locator('td:first-child').filter({ hasText: 'Uncertain unlinked' }) });
+  await expect(
+    ambiguous.getByRole('button', { name: 'Permit a new append on resume' }),
+  ).toBeDisabled();
+  await ambiguous.getByRole('checkbox').check();
+  await expect(
+    ambiguous.getByRole('button', { name: 'Permit a new append on resume' }),
+  ).toBeEnabled();
+  const failed = page
+    .getByRole('row')
+    .filter({ has: page.locator('td:first-child').filter({ hasText: 'Pre-copy failure' }) });
+  await failed.getByRole('button', { name: 'Permit retry after correcting failure' }).click();
+  await expect(
+    failed.getByRole('button', { name: 'Permit retry after correcting failure' }),
+  ).toHaveCount(0);
+  expect(action?.retryRead).toBe(true);
+  expect(action?.appendAgain).toBeUndefined();
+  expect(action?.acceptDuplicateRisk).toBeUndefined();
+});
